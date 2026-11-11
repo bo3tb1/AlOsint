@@ -38,44 +38,72 @@ The guiding invariant of the whole system:
 
 ### 1.1 Boundary philosophy
 
-Goose does not link against or call libcurl directly. It calls a **host C shim**
-(`http_client`) that exposes a *flat, allocation-free* C API. The shim is the
-only place in the system that touches `CURL*` handles. This keeps the FFI
-surface small, auditable, and free of callback-into-Goose reentrancy.
+Goose does not link against or call libcurl directly. It binds a **host C shim**
+(`http_client`) with Goose `extern fn` declarations and calls its *flat,
+allocation-free* C API. The shim is the only place in the system that touches
+`CURL*` handles. This keeps the FFI surface small, auditable, and free of
+callback-into-Goose reentrancy.
 
-All function arguments across the boundary are one of:
+Every C entry point the core uses is declared once, Goose-side, as an `extern fn`
+bound to the C symbol. The declaration is the whole contract Goose sees:
 
-- Scalars (`int32`, `uint64`, enums-as-`int32`).
-- **Borrowed const pointers** to fixed Goose buffers (`const uint8_t*` + `size_t cap`).
-- **Borrowed mutable pointers** to fixed Goose buffers that C fills (`uint8_t*` + `size_t cap` + `size_t* out_len`).
-- Borrowed const pointers to POD request-descriptor structs (layout frozen, see 1.4).
+```goose
+// Goose binding for a C symbol compiled from c/http_client.c (see §5).
+extern fn alosint_http_perform(req: HttpReq&, body: Buf&, meta: HttpResp&) -> i32;
+```
+
+Goose's FFI admits only types with a defined C representation, and a signature
+that uses an unsupported type is rejected at the declaration. The entire boundary
+is therefore expressed with four argument kinds:
+
+- **Scalars** — `i32`, `u32`, `u64`, `usize`; C enums are crossed as `i32`.
+- **Borrowed const slices** — `const u8[:]`. A slice crosses to C as
+  `{ const uint8_t *data; size_t len; }`, so it carries its own length. Used for
+  every read-only byte window Goose lends (URLs, header blocks, request bodies,
+  and the bytes handed to the JSON tokenizer). No NUL-termination or separate
+  length argument is needed.
+- **Borrowed mutable pointers** — `u8&`, a machine address into Goose-owned
+  storage that C writes through (paired with an explicit capacity). A Goose
+  reference is "a machine address that never dangles": because every shim call is
+  synchronous, the lent storage trivially outlives the call.
+- **Borrowed references to POD structs** — `HttpReq&`, `Buf&`, `HttpResp&`,
+  `DnsRr[:]` … passed by `&` (or as a mutable slice) for the in/out descriptors
+  whose layouts are frozen in the shared ABI (§1.4). C marks read-only ones
+  `const`.
 
 No pointer returned from C ever needs to outlive the call, and no pointer
 passed into C is retained by C after the call returns.
 
 ### 1.2 Passing fixed-capacity buffers safely
 
-A Goose response buffer is a plain reserved byte region plus bookkeeping:
+A Goose response buffer is a plain reserved byte region. The bytes are static
+Goose storage; a small `Buf` value is the mutable *view* Goose lends to C:
 
-```
-// Goose-side reserved storage (conceptual layout)
-ResponseBuffer {
-    bytes:    [RESP_CAP]u8    // RESP_CAP is a compile-time constant
-    len:      usize           // bytes currently valid, 0..=RESP_CAP
-    cap:      usize           // == RESP_CAP, passed explicitly to C
-    overflow: bool            // true if the source exceeded cap (truncated)
+```goose
+// Goose-side reserved storage (one slot of the ResponseBuffer pool, §3.2).
+struct ResponseBuffer {
+    bytes: [RESP_CAP]u8      // RESP_CAP is a compile-time constant
+}
+
+// The borrowed, fillable view passed across the FFI (mirrors alosint_buf_t).
+struct Buf {
+    bytes:    u8&            // mutable pointer into Goose-owned storage (&rb.bytes[0])
+    len:      usize          // written by C: bytes actually stored
+    cap:      usize          // read by C, never exceeded (== RESP_CAP)
+    overflow: bool           // set by C on truncation
 }
 ```
 
-The matching C view is a POD struct whose layout is **asserted to match** the
-Goose reservation (`static_assert(sizeof(...))` + explicit field offsets):
+`Buf` is passed as `body: Buf&`, so C receives a single `alosint_buf_t*`. The
+matching C view is a POD struct whose layout is **asserted to match** the Goose
+`Buf` field-for-field (`static_assert(sizeof(...))` + explicit field offsets):
 
 ```c
 typedef struct {
-    uint8_t *bytes;     // points into Goose-owned storage
+    uint8_t *bytes;     // the u8& — points into Goose-owned storage
     size_t   len;       // written by C
     size_t   cap;       // read by C, never exceeded
-    uint8_t  overflow;  // set by C on truncation
+    uint8_t  overflow;  // set by C on truncation (Goose bool is one byte)
 } alosint_buf_t;
 ```
 
@@ -98,11 +126,18 @@ to the user; it is never silent.
 
 ### 1.3 HTTP/HTTPS request flow across the FFI
 
-A single blocking request is modeled as one C call:
+A single blocking request is modeled as one C call. Goose binds it as:
+
+```goose
+// req is borrowed read-only; body/meta are borrowed and C-filled.
+// Returns 0 on transport success (check meta for HTTP code),
+// negative alosint_err_t on transport failure.
+extern fn alosint_http_perform(req: HttpReq&, body: Buf&, meta: HttpResp&) -> i32;
+```
+
+which maps directly onto the C symbol the shim defines:
 
 ```c
-// Returns 0 on transport success (check status for HTTP code),
-// negative alosint_err_t on transport failure.
 int alosint_http_perform(const alosint_http_req_t *req,   // borrowed, const
                          alosint_buf_t           *body,   // borrowed, C fills
                          alosint_http_resp_t     *meta);   // borrowed, C fills
@@ -123,17 +158,40 @@ Goose; they are freed by libcurl on handle reset/cleanup.
 
 ### 1.4 Request descriptor (frozen POD)
 
+The Goose descriptor carries its borrowed strings as `const u8[:]` slices, so no
+field is NUL-terminated and the explicit `body_len` disappears — each slice
+already carries its length. `method`/`route` cross as `i32` (the C enum values):
+
+```goose
+// C enum values, crossed as i32: Get=0 Post=1 Head=2 / Direct=0 Tor=1
+struct HttpReq {
+    url:                 const u8[:]   // borrowed slice from a Goose string arena
+    method:              i32
+    route:               i32
+    headers:             const u8[:]   // borrowed CRLF-joined block (len 0 = none)
+    body:                const u8[:]   // borrowed POST body (len 0 = none)
+    timeout_ms:          u32
+    connect_timeout_ms:  u32
+    verify_tls:          bool          // true = verify peer+host (default)
+}
+```
+
+Each `const u8[:]` field lowers to a `{ const uint8_t *data; size_t len; }` pair,
+so the frozen C mirror is spelled with those pairs and its layout is
+`static_assert`ed to match `HttpReq`:
+
 ```c
 typedef enum { HTTP_GET = 0, HTTP_POST = 1, HTTP_HEAD = 2 } alosint_method_t;
 typedef enum { ROUTE_DIRECT = 0, ROUTE_TOR = 1 } alosint_route_t;
 
+typedef struct { const uint8_t *data; size_t len; } alosint_slice_t;  // == const u8[:]
+
 typedef struct {
-    const char      *url;          // borrowed, NUL-terminated, from Goose arena
-    alosint_method_t method;
-    alosint_route_t  route;
-    const char      *headers;      // borrowed CRLF-joined block, or NULL
-    const uint8_t   *body;         // borrowed POST body, or NULL
-    size_t           body_len;
+    alosint_slice_t  url;          // borrowed, from Goose arena
+    int32_t          method;       // alosint_method_t
+    int32_t          route;        // alosint_route_t
+    alosint_slice_t  headers;      // borrowed CRLF-joined block (len 0 = none)
+    alosint_slice_t  body;         // borrowed POST body (len 0 = none)
     uint32_t         timeout_ms;
     uint32_t         connect_timeout_ms;
     uint8_t          verify_tls;   // 1 = verify peer+host (default)
@@ -141,7 +199,7 @@ typedef struct {
 ```
 
 Strings are produced in a Goose string arena and passed as borrowed const
-pointers. Because the call is synchronous, borrow lifetimes are trivially valid
+slices. Because the call is synchronous, borrow lifetimes are trivially valid
 for the duration of `alosint_http_perform`.
 
 ### 1.5 Optional Tor routing (SOCKS5 on 127.0.0.1:9050)
@@ -189,9 +247,22 @@ Configuration:
 - **Proxied requests:** DNS is delegated to Tor via `socks5h`. No local
   resolution occurs. This is the default and preferred path for anonymity.
 - **Direct requests:** libcurl uses the system resolver. An optional `dns` C
-  module can expose explicit lookups (A/AAAA/MX/TXT/NS) for OSINT plugins that
-  enumerate records, filling a fixed `alosint_dns_rr_t[]` array (borrowed,
-  C-filled, bounded by capacity — same ownership rules as §1.2).
+  module (compiled from `c/dns.c`, §5) can expose explicit lookups
+  (A/AAAA/MX/TXT/NS) for OSINT plugins that enumerate records, filling a fixed
+  `DnsRr` array (borrowed, C-filled, bounded by capacity — same ownership rules
+  as §1.2). Goose binds it as:
+
+  ```goose
+  // name: borrowed read-only slice. out: a mutable slice Goose lends; C fills
+  // it up to out.len (its capacity) and writes the count through `n`.
+  // Returns 0, or negative alosint_err_t.
+  extern fn alosint_dns_query(name: const u8[:], rr_type: i32,
+                              out: DnsRr[:], n: usize&) -> i32;
+  ```
+
+  The mutable slice `DnsRr[:]` crosses as `{ alosint_dns_rr_t *data; size_t len; }`
+  (its `len` is the capacity C must not exceed), and `n: usize&` is the borrowed
+  out-count — no array memory is ever allocated or freed across the boundary.
 - **Leak guard:** a test asserts that in `force` mode every outbound request
   carries a `socks5h` proxy and that no `dns` lookup fires. CI runs this against
   a local SOCKS stub.
@@ -337,7 +408,24 @@ is a producer that writes through host-controlled, capacity-checked sinks.
 ### 2.5 Loading, executing, unloading `.so` plugins
 
 The `plugin_loader` (Goose) drives a thin C `plugin_host` shim that wraps
-`dlopen`/`dlsym`/`dlclose` (Goose does not call libdl directly):
+`dlopen`/`dlsym`/`dlclose` (Goose does not call libdl directly). Goose binds the
+shim with `extern fn` declarations that trade only in slices, scalars, and
+borrowed struct references — never a raw `void*`:
+
+```goose
+// Open a plugin by path; returns a registry index (>=0) or negative err.
+// The raw void* from dlopen stays on the C side, keyed by this index.
+extern fn alosint_dl_open(path: const u8[:]) -> i32;
+
+// Run the handshake + info load for an opened plugin; C fills `info`.
+extern fn alosint_dl_probe(idx: i32, info: PluginInfo&) -> i32;
+
+// Close and release the slot.
+extern fn alosint_dl_close(idx: i32) -> i32;
+```
+
+The Goose side holds only the `i32` index; the native handle never crosses the
+boundary, so Goose cannot manipulate (or mistakenly free) a `void*`.
 
 **Discovery & load**
 
@@ -508,6 +596,18 @@ int alosint_json_parse(const uint8_t *buf, size_t len,
                        alosint_jtok_t *toks, size_t tok_cap);
 ```
 
+Goose binds it with the input bytes as a read-only slice and the token array as
+a mutable slice it lends:
+
+```goose
+// buf: the filled ResponseBuffer bytes, read-only.
+// toks: Goose-owned fixed token storage; toks.len is JSON_TOK_CAP.
+extern fn alosint_json_parse(buf: const u8[:], toks: JTok[:]) -> i32;
+```
+
+The `const u8[:]` and `JTok[:]` slices each carry their own length, so the C
+`len`/`tok_cap` arguments fold into the slices Goose passes.
+
 - **Values are slices**, read directly from the source buffer by offset. A field
   value is only copied once — when the plugin hands it to `sink.field`, which
   arena-copies it into Goose storage that outlives the response buffer.
@@ -586,8 +686,10 @@ Errors are data, carried in records and a run summary, never exceptions.
 ### 4.3 The three contract seams
 
 1. **Goose ↔ host C shims** (`host_api` → `http_client`/`dns`/`json_parser`/
-   `plugin_host`): flat, synchronous, borrow-only C functions. The narrow, fully
-   audited FFI surface.
+   `plugin_host`): flat, synchronous, borrow-only C functions bound with Goose
+   `extern fn` declarations and reached through `const u8[:]` slices, `u8&`
+   pointers, and borrowed struct references. The narrow, fully audited FFI
+   surface.
 2. **Host ↔ plugin** (`alosint_host_api_t` vtable + `alosint_plugin_*` exports):
    the versioned plugin ABI. Capabilities flow host→plugin; data flows
    plugin→host via `sink`.
@@ -617,13 +719,15 @@ safely with libcurl and arbitrary C `.so` code.
 
 ```
 alosint/
+  alosint.goose     # Goose program entry point
+  alosint.build     # Goose build sidecar: lists the C sources to compile in
   src/              # Goose core (cli, orchestrator, host_api, record_store, ...)
   c/
     abi/            # alosint_plugin.h, alosint_ffi.h  (shared contract)
-    http_client/    # libcurl wrapper
-    json_parser/    # in-place tokenizer
-    plugin_host/    # dlopen shim
-    dns/
+    http_client.c   # libcurl wrapper
+    json_parser.c   # in-place tokenizer
+    plugin_host.c   # dlopen shim
+    dns.c           # optional explicit resolver
   plugins/          # built .so OSINT sources (loaded at runtime)
     dns_enum/
     crt_sh/
@@ -632,10 +736,25 @@ alosint/
   ARCHITECTURE.md
 ```
 
-- Core links libcurl and libdl via the C shim objects; plugins link only against
-  `abi/` headers (no libcurl dependency in plugins).
-- ABI compatibility is enforced at compile time (`static_assert` in `abi/`) and
-  at load time (`alosint_plugin_abi_version`).
+The core's C shims are compiled into the Goose program through the build
+sidecar that sits beside `alosint.goose`. Goose reads `alosint.build` and
+compiles each listed C source, so the program's `extern fn` declarations resolve
+against those objects:
+
+```
+// alosint.build
+c_sources = ["c/http_client.c", "c/json_parser.c", "c/plugin_host.c", "c/dns.c"];
+```
+
+- Each C module is reached only through the `extern fn` bindings shown in §1–§3;
+  the Goose side never calls libcurl, libdl, or the resolver directly. libcurl
+  and libdl are linked by the shim objects named in `c_sources`.
+- Plugins are built separately as `.so`s against `abi/` headers only (no libcurl
+  dependency in plugins) and are loaded at runtime via the `plugin_host` shim —
+  they are not part of `c_sources`.
+- ABI compatibility is enforced at compile time (`static_assert` in `abi/`, which
+  also pins every slice/struct layout the `extern fn`s rely on) and at load time
+  (`alosint_plugin_abi_version`).
 
 ---
 
