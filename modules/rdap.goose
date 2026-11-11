@@ -91,3 +91,7 @@ fn summary(json: const u8[:], out_buf: u8[>..]&) {
         out_buf.push(buf[i]);
     }
 }
+
+fn format_summary(json: const u8[:], out_buf: u8[>..]&) {
+    summary(json, out_buf);
+}

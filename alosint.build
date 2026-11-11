@@ -2,5 +2,5 @@
 // Lists the C sources compiled into the program so that `extern fn`
 // declarations (e.g. in modules/dns.goose, modules/rdap.goose) resolve against
 // them, plus the native libraries those sources require.
-c_sources = ["c/dns.c", "c/rdap.c", "c/json_extract.c"];
+c_sources = ["c/dns.c", "c/rdap.c", "c/json_extract.c", "c/crtsh.c"];
 c_libs_linux = ["curl"];
