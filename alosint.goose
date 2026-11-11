@@ -1,4 +1,5 @@
 import os;
+import modules.dns;
 
 let HELP = """
     AlOsint 1.0.0 - passive OSINT for authorized targets
@@ -68,8 +69,14 @@ fn parse_args() -> Config {
 
 fn main() {
     let cfg = parse_args();
-    print("AlOsint 1.0.0 - parsed configuration");
-    print("  domain = ", cfg.domain);
-    print("  json   = ", cfg.json);
-    print("  tor    = ", cfg.tor);
+    var ip: u8[>..] = [];
+    if dns::lookup(cfg.domain, ip) {
+        if cfg.json {
+            print("{\"domain\":\"", cfg.domain, "\",\"ip\":\"", ip, "\"}");
+        } else {
+            print(cfg.domain, " resolves to: ", ip);
+        }
+    } else {
+        print(cfg.domain, " could not be resolved");
+    }
 }
