@@ -8,6 +8,8 @@
 // owns every byte buffer; C only writes into the window it is lent, bounded by
 // the capacity Goose passes, and never allocates storage Goose must free.
 
+namespace rdap;
+
 // Bind the C symbol:
 //     int alosint_rdap_lookup(const char *domain, char *json_out, int max_len);
 // `domain` and `json_out` cross as plain byte pointers (u8&); `max_len` is a C
@@ -25,7 +27,7 @@ fn lookup(domain: const u8[:], out_buf: u8[>..]&) -> bool {
     // The C side needs a NUL-terminated string. Copy the borrowed slice into a
     // Goose-owned builder and terminate it ourselves.
     var name: u8[>..] = [];
-    for i: i32 in 0..domain.len {
+    for i: i64 in 0..domain.len {
         name.push(domain[i]);
     }
     name.push(0);
@@ -42,7 +44,7 @@ fn lookup(domain: const u8[:], out_buf: u8[>..]&) -> bool {
     }
 
     // Copy the NUL-terminated body into the caller's builder.
-    for i: i32 in 0..json.len {
+    for i: i64 in 0..json.len {
         if json[i] == 0 {
             break;
         }

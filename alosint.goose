@@ -1,15 +1,17 @@
 import os;
 import modules.dns;
+import modules.rdap;
 
 let HELP = """
     AlOsint 1.0.0 - passive OSINT for authorized targets
 
     Usage:
-      alosint -d <domain> [--json] [--tor]
+      alosint -d <domain> [--rdap] [--json] [--tor]
       alosint -h | --help
 
     Options:
       -d, --domain <domain>  Target domain to investigate (required)
+          --rdap             Retrieve raw RDAP registration data
           --json             Emit JSON output (reserved for a later step)
           --tor              Route HTTP(S) through a local SOCKS5 proxy
       -h, --help             Print this help and exit
@@ -24,6 +26,7 @@ let HELP = """
 struct Config {
     json: bool,
     tor: bool,
+    rdap: bool,
     domain: u8[>..],
 }
 
@@ -38,6 +41,7 @@ fn parse_args() -> Config {
     var domain: u8[>..] = [];
     var json = false;
     var tor = false;
+    var rdap = false;
     var i = 1;
     while i < argv.len {
         let a = argv[i];
@@ -58,13 +62,15 @@ fn parse_args() -> Config {
             json = true;
         } else if a == "--tor" {
             tor = true;
+        } else if a == "--rdap" {
+            rdap = true;
         } else {
             usage_error(str("unknown option: ", a));
         }
         i++;
     }
     if domain.len == 0 { usage_error("missing required -d/--domain"); }
-    return Config { json: json, tor: tor, domain: domain };
+    return Config { json: json, tor: tor, rdap: rdap, domain: domain };
 }
 
 fn main() {
@@ -78,5 +84,13 @@ fn main() {
         }
     } else {
         print(cfg.domain, " could not be resolved");
+    }
+    if cfg.rdap {
+        var rdap_data: u8[>..] = [];
+        if rdap::lookup(cfg.domain, rdap_data) {
+            print("RDAP Data for ", cfg.domain, ": ", rdap_data);
+        } else {
+            print("RDAP Data for ", cfg.domain, " could not be retrieved");
+        }
     }
 }
