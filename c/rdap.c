@@ -78,7 +78,8 @@ static int rdap_valid_domain(const char *d)
 #if defined(LIBCURL_VERSION_NUM) && LIBCURL_VERSION_NUM >= 0x075000
 #define RDAP_HAVE_PREREQ 1
 
-/* `a` is an IPv4 address in host byte order. */
+/* `a` is an IPv4 address in host byte order. Returns 1 for any address that is
+ * not a normal, globally-routable unicast host. */
 static int rdap_ipv4_is_private(uint32_t a)
 {
     if ((a >> 24) == 0)   return 1;                 /* 0.0.0.0/8   "this host" */
@@ -88,7 +89,17 @@ static int rdap_ipv4_is_private(uint32_t a)
     if ((a >> 20) == (((uint32_t)172 << 4) | 1))   return 1; /* 172.16.0.0/12  private  */
     if ((a >> 16) == (((uint32_t)192 << 8) | 168)) return 1; /* 192.168.0.0/16 private  */
     if ((a >> 22) == (((uint32_t)100 << 2) | 1))   return 1; /* 100.64.0.0/10  CGNAT    */
+    if ((a & 0xFFFE0000u) == 0xC6120000u) return 1; /* 198.18.0.0/15  benchmarking */
+    if ((a & 0xF0000000u) == 0xE0000000u) return 1; /* 224.0.0.0/4    multicast    */
+    if ((a & 0xF0000000u) == 0xF0000000u) return 1; /* 240.0.0.0/4    reserved + 255.255.255.255 */
     return 0;
+}
+
+/* Pull the low 32 bits (bytes 12..15) of an IPv6 address as a host-order IPv4. */
+static uint32_t rdap_embedded_v4(const unsigned char *b)
+{
+    return ((uint32_t)b[12] << 24) | ((uint32_t)b[13] << 16) |
+           ((uint32_t)b[14] << 8)  |  (uint32_t)b[15];
 }
 
 static int rdap_ip_is_private(const char *ip)
@@ -109,30 +120,57 @@ static int rdap_ip_is_private(const char *ip)
         if (all_zero) {
             return 1; /* ::  unspecified */
         }
+
+        if (b[0] == 0xff) {
+            return 1; /* ff00::/8 multicast */
+        }
         if (b[0] == 0xfe && (b[1] & 0xc0) == 0x80) {
             return 1; /* fe80::/10 link-local */
+        }
+        if (b[0] == 0xfe && (b[1] & 0xc0) == 0xc0) {
+            return 1; /* fec0::/10 site-local (deprecated) */
         }
         if ((b[0] & 0xfe) == 0xfc) {
             return 1; /* fc00::/7 unique local */
         }
 
-        /* ::1 loopback and ::ffff:a.b.c.d IPv4-mapped (/96). */
         static const unsigned char loopback[16] =
             { 0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,1 };
         if (memcmp(b, loopback, 16) == 0) {
-            return 1;
+            return 1; /* ::1 loopback */
         }
-        static const unsigned char mapped_prefix[12] =
-            { 0,0,0,0, 0,0,0,0, 0,0,0xff,0xff };
-        if (memcmp(b, mapped_prefix, 12) == 0) {
-            uint32_t a = ((uint32_t)b[12] << 24) | ((uint32_t)b[13] << 16) |
-                         ((uint32_t)b[14] << 8)  |  (uint32_t)b[15];
+
+        /* 2002::/16 6to4: embedded IPv4 is bytes 2..5. */
+        if (b[0] == 0x20 && b[1] == 0x02) {
+            uint32_t a = ((uint32_t)b[2] << 24) | ((uint32_t)b[3] << 16) |
+                         ((uint32_t)b[4] << 8)  |  (uint32_t)b[5];
             return rdap_ipv4_is_private(a);
         }
-        return 0;
+
+        /* 64:ff9b::/96 (well-known NAT64) and 64:ff9b:1::/48 (local-use NAT64):
+         * embedded IPv4 in the low 32 bits; block the local /48 outright. */
+        if (b[0] == 0x00 && b[1] == 0x64 && b[2] == 0xff && b[3] == 0x9b) {
+            if (b[4] == 0x00 && b[5] == 0x01) {
+                return 1; /* 64:ff9b:1::/48 local-use */
+            }
+            return rdap_ipv4_is_private(rdap_embedded_v4(b));
+        }
+
+        /* ::ffff:a.b.c.d IPv4-mapped (/96) and ::a.b.c.d IPv4-compatible (/96,
+         * deprecated): run the embedded IPv4 through the v4 checks. */
+        static const unsigned char mapped_prefix[12] =
+            { 0,0,0,0, 0,0,0,0, 0,0,0xff,0xff };
+        static const unsigned char compat_prefix[12] =
+            { 0,0,0,0, 0,0,0,0, 0,0,0,0 };
+        if (memcmp(b, mapped_prefix, 12) == 0 ||
+            memcmp(b, compat_prefix, 12) == 0) {
+            return rdap_ipv4_is_private(rdap_embedded_v4(b));
+        }
+
+        return 0; /* a routable, public IPv6 address */
     }
 
-    return 0; /* unparseable address: let libcurl decide */
+    return 1; /* fail closed: an address we cannot parse is treated as unsafe */
 }
 
 /* Runs after DNS resolution and before each request (including every redirect
@@ -146,7 +184,8 @@ static int rdap_prereq_cb(void *clientp,
     (void)conn_primary_port;
     (void)conn_local_port;
 
-    if (conn_primary_ip != NULL && rdap_ip_is_private(conn_primary_ip)) {
+    /* No IP string, or a private/unparseable one: refuse (fail closed). */
+    if (conn_primary_ip == NULL || rdap_ip_is_private(conn_primary_ip)) {
         return CURL_PREREQFUNC_ABORT;
     }
     return CURL_PREREQFUNC_OK;
@@ -168,6 +207,17 @@ int alosint_rdap_lookup(const char *domain, char *json_out, int max_len)
         return -1;
     }
 
+#ifdef RDAP_HAVE_PREREQ
+    /* Fail closed if the running libcurl is too old to install the SSRF guard
+     * the compiled code relies on. */
+    {
+        curl_version_info_data *vi = curl_version_info(CURLVERSION_NOW);
+        if (vi == NULL || vi->version_num < 0x075000) {
+            return -1;
+        }
+    }
+#endif
+
     char url[600];
     int n = snprintf(url, sizeof(url), "https://rdap.org/domain/%s", domain);
     if (n < 0 || (size_t)n >= sizeof(url)) {
@@ -184,33 +234,46 @@ int alosint_rdap_lookup(const char *domain, char *json_out, int max_len)
     sink.cap = (size_t)max_len - 1; /* reserve one byte for the NUL terminator */
     sink.len = 0;
 
-    curl_easy_setopt(curl, CURLOPT_URL, url);
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, rdap_write_cb);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &sink);
-    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L); /* rdap.org bootstraps via redirect */
-    curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 8L);
-    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
-    curl_easy_setopt(curl, CURLOPT_USERAGENT, "alosint/0.1");
-    curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, ""); /* accept any supported encoding */
-    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
-    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
-    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
+    /* Every option is checked: a security-relevant setopt that silently failed
+     * would let the request run without its protection (fail open). On any
+     * failure we abort before performing the request. */
+#define RDAP_SET(opt, val)                                      \
+    do {                                                        \
+        if (curl_easy_setopt(curl, (opt), (val)) != CURLE_OK) { \
+            curl_easy_cleanup(curl);                            \
+            return -1;                                          \
+        }                                                       \
+    } while (0)
+
+    RDAP_SET(CURLOPT_URL, url);
+    RDAP_SET(CURLOPT_WRITEFUNCTION, rdap_write_cb);
+    RDAP_SET(CURLOPT_WRITEDATA, &sink);
+    RDAP_SET(CURLOPT_FOLLOWLOCATION, 1L); /* rdap.org bootstraps via redirect */
+    RDAP_SET(CURLOPT_MAXREDIRS, 8L);
+    RDAP_SET(CURLOPT_CONNECTTIMEOUT, 10L);
+    RDAP_SET(CURLOPT_TIMEOUT, 30L);
+    RDAP_SET(CURLOPT_USERAGENT, "alosint/0.1");
+    RDAP_SET(CURLOPT_ACCEPT_ENCODING, ""); /* accept any supported encoding */
+    RDAP_SET(CURLOPT_NOSIGNAL, 1L);
+    RDAP_SET(CURLOPT_SSL_VERIFYPEER, 1L);
+    RDAP_SET(CURLOPT_SSL_VERIFYHOST, 2L);
 
     /* Constrain the scheme to HTTPS for the initial request and for every
      * redirect target, so a redirect cannot escape to file://, gopher://, etc. */
 #if defined(LIBCURL_VERSION_NUM) && LIBCURL_VERSION_NUM >= 0x075500
-    curl_easy_setopt(curl, CURLOPT_PROTOCOLS_STR, "https");
-    curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS_STR, "https");
+    RDAP_SET(CURLOPT_PROTOCOLS_STR, "https");
+    RDAP_SET(CURLOPT_REDIR_PROTOCOLS_STR, "https");
 #else
-    curl_easy_setopt(curl, CURLOPT_PROTOCOLS, (long)CURLPROTO_HTTPS);
-    curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS, (long)CURLPROTO_HTTPS);
+    RDAP_SET(CURLOPT_PROTOCOLS, (long)CURLPROTO_HTTPS);
+    RDAP_SET(CURLOPT_REDIR_PROTOCOLS, (long)CURLPROTO_HTTPS);
 #endif
 
     /* Reject connections to private/loopback/link-local hosts (SSRF guard). */
 #ifdef RDAP_HAVE_PREREQ
-    curl_easy_setopt(curl, CURLOPT_PREREQFUNCTION, rdap_prereq_cb);
+    RDAP_SET(CURLOPT_PREREQFUNCTION, rdap_prereq_cb);
 #endif
+
+#undef RDAP_SET
 
     CURLcode res = curl_easy_perform(curl);
 
