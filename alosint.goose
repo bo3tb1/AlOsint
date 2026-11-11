@@ -1,4 +1,5 @@
 import os;
+import modules.crtsh;
 import modules.dns;
 import modules.rdap;
 
@@ -6,12 +7,13 @@ let HELP = """
     AlOsint 1.0.0 - passive OSINT for authorized targets
 
     Usage:
-      alosint -d <domain> [--rdap] [--json] [--tor]
+      alosint -d <domain> [--rdap] [--subdomains] [--json] [--tor]
       alosint -h | --help
 
     Options:
       -d, --domain <domain>  Target domain to investigate (required)
-          --rdap             Retrieve raw RDAP registration data
+          --rdap             Retrieve RDAP registration summary
+          --subdomains       Discover subdomains via Certificate Transparency (crt.sh)
           --json             Emit JSON output (reserved for a later step)
           --tor              Route HTTP(S) through a local SOCKS5 proxy
       -h, --help             Print this help and exit
@@ -27,6 +29,7 @@ struct Config {
     json: bool,
     tor: bool,
     rdap: bool,
+    subdomains: bool,
     domain: u8[>..],
 }
 
@@ -42,6 +45,7 @@ fn parse_args() -> Config {
     var json = false;
     var tor = false;
     var rdap = false;
+    var subdomains = false;
     var i = 1;
     while i < argv.len {
         let a = argv[i];
@@ -64,13 +68,15 @@ fn parse_args() -> Config {
             tor = true;
         } else if a == "--rdap" {
             rdap = true;
+        } else if a == "--subdomains" {
+            subdomains = true;
         } else {
             usage_error(str("unknown option: ", a));
         }
         i++;
     }
     if domain.len == 0 { usage_error("missing required -d/--domain"); }
-    return Config { json: json, tor: tor, rdap: rdap, domain: domain };
+    return Config { json: json, tor: tor, rdap: rdap, subdomains: subdomains, domain: domain };
 }
 
 fn main() {
@@ -88,9 +94,19 @@ fn main() {
     if cfg.rdap {
         var rdap_data: u8[>..] = [];
         if rdap::lookup(cfg.domain, rdap_data) {
-            print("RDAP Data for ", cfg.domain, ": ", rdap_data);
+            var summary: u8[>..] = [];
+            rdap::format_summary(rdap_data, summary);
+            print("RDAP Summary for ", cfg.domain, ": ", summary);
         } else {
             print("RDAP Data for ", cfg.domain, " could not be retrieved");
+        }
+    }
+    if cfg.subdomains {
+        var crtsh_data: u8[>..] = [];
+        if crtsh::lookup(cfg.domain, crtsh_data) {
+            print(crtsh_data);
+        } else {
+            print(cfg.domain, " subdomain lookup failed");
         }
     }
 }
