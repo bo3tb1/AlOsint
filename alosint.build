@@ -1,1 +1,4 @@
+// alosint.build — Goose build sidecar beside alosint.goose.
+// Lists the C sources compiled into the program so that `extern fn`
+// declarations (e.g. in modules/dns.goose) resolve against them.
 c_sources = ["c/dns.c"];
