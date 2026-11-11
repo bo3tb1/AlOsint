@@ -7,6 +7,8 @@
 // owns every byte buffer; C only writes into buffers it is lent, bounded by the
 // capacity Goose passes, and never allocates storage Goose must later free.
 
+namespace dns;
+
 // Bind the C symbol:
 //     int alosint_dns_lookup(const char *domain, char *ip_out, int max_len);
 // `domain` and `ip_out` cross as plain byte pointers (u8&); `max_len` is a C
@@ -20,7 +22,7 @@ fn lookup(domain: const u8[:], out_buf: u8[>..]&) -> bool {
     // getaddrinfo() needs a NUL-terminated C string. Copy the borrowed slice
     // into a Goose-owned builder and terminate it ourselves.
     var name: u8[>..] = [];
-    for i: i32 in 0..domain.len {
+    for i: i64 in 0..domain.len {
         name.push(domain[i]);
     }
     name.push(0);
@@ -28,7 +30,7 @@ fn lookup(domain: const u8[:], out_buf: u8[>..]&) -> bool {
     // Lend C a fixed, Goose-owned window for the result. INET_ADDRSTRLEN is 16,
     // so 64 bytes is ample; C writes a NUL-terminated dotted quad into it.
     var ip: u8[>..] = [];
-    for i: i32 in 0..64 {
+    for i: i64 in 0..64 {
         ip.push(0);
     }
 
@@ -38,7 +40,7 @@ fn lookup(domain: const u8[:], out_buf: u8[>..]&) -> bool {
     }
 
     // Copy the NUL-terminated result into the caller's builder.
-    for i: i32 in 0..ip.len {
+    for i: i64 in 0..ip.len {
         if ip[i] == 0 {
             break;
         }
