@@ -37,3 +37,37 @@ fn lookup(domain: const u8[:], out_buf: u8[>..]&) -> bool {
     }
     true
 }
+
+//     int alosint_crtsh_extract_unique(const char *json_str, const char *domain,
+//                                      char *out_buf, int max_len);
+extern fn alosint_crtsh_extract_unique(json_str: u8&, domain: u8&, out_buf: u8&, max_len: i32) -> i32;
+
+let SUMMARY_CAP: i32 = 65536;
+
+fn summary(json: const u8[:], domain: const u8[:], out_buf: u8[>..]&) -> i32 {
+    var src: u8[>..] = [];
+    for i: i64 in 0..json.len {
+        src.push(json[i]);
+    }
+    src.push(0);
+
+    var name: u8[>..] = [];
+    for i: i64 in 0..domain.len {
+        name.push(domain[i]);
+    }
+    name.push(0);
+
+    var buf: u8[>..] = [];
+    for i: i32 in 0..SUMMARY_CAP {
+        buf.push(0);
+    }
+
+    let rc = alosint_crtsh_extract_unique(src[0], name[0], buf[0], SUMMARY_CAP);
+    for i: i64 in 0..buf.len {
+        if buf[i] == 0 {
+            break;
+        }
+        out_buf.push(buf[i]);
+    }
+    rc
+}

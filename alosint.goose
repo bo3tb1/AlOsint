@@ -7,13 +7,14 @@ let HELP = """
     AlOsint 1.0.0 - passive OSINT for authorized targets
 
     Usage:
-      alosint -d <domain> [--rdap] [--subdomains] [--json] [--tor]
+      alosint -d <domain> [--rdap] [--subdomains] [--subdomains-raw] [--json] [--tor]
       alosint -h | --help
 
     Options:
       -d, --domain <domain>  Target domain to investigate (required)
           --rdap             Retrieve RDAP registration summary
-          --subdomains       Discover subdomains via Certificate Transparency (crt.sh)
+          --subdomains       Print unique subdomains discovered via crt.sh
+          --subdomains-raw   Print raw crt.sh JSON
           --json             Emit JSON output (reserved for a later step)
           --tor              Route HTTP(S) through a local SOCKS5 proxy
       -h, --help             Print this help and exit
@@ -30,6 +31,7 @@ struct Config {
     tor: bool,
     rdap: bool,
     subdomains: bool,
+    subdomains_raw: bool,
     domain: u8[>..],
 }
 
@@ -46,6 +48,7 @@ fn parse_args() -> Config {
     var tor = false;
     var rdap = false;
     var subdomains = false;
+    var subdomains_raw = false;
     var i = 1;
     while i < argv.len {
         let a = argv[i];
@@ -70,13 +73,15 @@ fn parse_args() -> Config {
             rdap = true;
         } else if a == "--subdomains" {
             subdomains = true;
+        } else if a == "--subdomains-raw" {
+            subdomains_raw = true;
         } else {
             usage_error(str("unknown option: ", a));
         }
         i++;
     }
     if domain.len == 0 { usage_error("missing required -d/--domain"); }
-    return Config { json: json, tor: tor, rdap: rdap, subdomains: subdomains, domain: domain };
+    return Config { json: json, tor: tor, rdap: rdap, subdomains: subdomains, subdomains_raw: subdomains_raw, domain: domain };
 }
 
 fn main() {
@@ -104,7 +109,22 @@ fn main() {
     if cfg.subdomains {
         var crtsh_data: u8[>..] = [];
         if crtsh::lookup(cfg.domain, crtsh_data) {
-            print(crtsh_data);
+            var names: u8[>..] = [];
+            let count = crtsh::summary(crtsh_data, cfg.domain, names);
+            if count > 0 {
+                print("\nUnique subdomains (", count, "):\n");
+                print(names);
+            } else {
+                print("No subdomains found.");
+            }
+        } else {
+            print(cfg.domain, " subdomain lookup failed");
+        }
+    }
+    if cfg.subdomains_raw {
+        var raw_data: u8[>..] = [];
+        if crtsh::lookup(cfg.domain, raw_data) {
+            print(raw_data);
         } else {
             print(cfg.domain, " subdomain lookup failed");
         }
