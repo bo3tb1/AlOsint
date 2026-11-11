@@ -52,3 +52,42 @@ fn lookup(domain: const u8[:], out_buf: u8[>..]&) -> bool {
     }
     true
 }
+
+// Bind the C symbol:
+//     void alosint_extract_rdap_summary(const char *json_str,
+//                                        char *out_buf, int max_len);
+// `json_str` and `out_buf` cross as plain byte pointers (u8&); `max_len` is a C
+// int (i32). The C side never fails loudly: it always writes a formatted line.
+extern fn alosint_extract_rdap_summary(json_str: u8&, out_buf: u8&, max_len: i32);
+
+// Capacity of the summary window lent to C, in bytes.
+let SUMMARY_CAP: i32 = 512;
+
+// summary distills raw RDAP `json` into a one-line human summary
+// ("Registrar: ... | Registered: ...") and appends it (without a trailing NUL)
+// to the caller-owned builder `out_buf`.
+fn summary(json: const u8[:], out_buf: u8[>..]&) {
+    // The C side needs a NUL-terminated string. Copy the borrowed slice into a
+    // Goose-owned builder and terminate it ourselves.
+    var src: u8[>..] = [];
+    for i: i64 in 0..json.len {
+        src.push(json[i]);
+    }
+    src.push(0);
+
+    // Lend C a fixed, Goose-owned window for the formatted summary.
+    var buf: u8[>..] = [];
+    for i: i32 in 0..SUMMARY_CAP {
+        buf.push(0);
+    }
+
+    alosint_extract_rdap_summary(src[0], buf[0], SUMMARY_CAP);
+
+    // Copy the NUL-terminated summary into the caller's builder.
+    for i: i64 in 0..buf.len {
+        if buf[i] == 0 {
+            break;
+        }
+        out_buf.push(buf[i]);
+    }
+}
