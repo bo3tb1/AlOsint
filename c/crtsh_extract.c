@@ -47,11 +47,26 @@ static int append_line(char *out, size_t cap, size_t *olen,
     return 1;
 }
 
-/* Normalize one raw name token and, if it matches, de-dup and append it. */
-static void process_token(const char *raw, size_t rawlen,
-                          const char *domain_lc, size_t dlen,
-                          char *out, size_t cap, size_t *olen, int *count)
+/* Per-token handler: receives one raw (undecoded-split) token and decides
+ * whether to keep it. `ctx` carries handler-specific state (or NULL). */
+typedef void (*crtsh_token_fn)(const char *raw, size_t rawlen, void *ctx,
+                               char *out, size_t cap, size_t *olen, int *count);
+
+/* Context for the sub-domain handler. */
+struct domain_ctx {
+    const char *domain_lc;
+    size_t      dlen;
+};
+
+/* Normalize one raw name token and, if it is a sub-domain of the target, de-dup
+ * and append it. */
+static void process_domain_token(const char *raw, size_t rawlen, void *ctxv,
+                                 char *out, size_t cap, size_t *olen, int *count)
 {
+    const struct domain_ctx *ctx = (const struct domain_ctx *)ctxv;
+    const char *domain_lc = ctx->domain_lc;
+    size_t dlen = ctx->dlen;
+
     /* Trim leading/trailing whitespace. */
     size_t s = 0;
     size_t e = rawlen;
@@ -99,12 +114,54 @@ static void process_token(const char *raw, size_t rawlen,
     }
 }
 
+/* Keep one raw token if it looks like an email: contains '@' and no interior
+ * whitespace. Original case is preserved. */
+static void process_email_token(const char *raw, size_t rawlen, void *ctxv,
+                                char *out, size_t cap, size_t *olen, int *count)
+{
+    (void)ctxv;
+
+    size_t s = 0;
+    size_t e = rawlen;
+    while (s < e && is_ws(raw[s])) {
+        s++;
+    }
+    while (e > s && is_ws(raw[e - 1])) {
+        e--;
+    }
+
+    size_t len = e - s;
+    if (len == 0 || len > CRTSH_NAME_MAX) {
+        return;
+    }
+
+    int has_at = 0;
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)raw[s + i];
+        if (c == '@') {
+            has_at = 1;
+        } else if (is_ws((char)c)) {
+            return; /* interior whitespace: not an email */
+        }
+    }
+    if (!has_at) {
+        return;
+    }
+
+    if (line_present(out, *olen, raw + s, len)) {
+        return;
+    }
+    if (append_line(out, cap, olen, raw + s, len)) {
+        (*count)++;
+    }
+}
+
 /* Scan one "name_value" string value starting at its opening quote `p`.
  * Decodes \" and \n (and a few harmless extras), splits on decoded newlines,
- * and feeds each token to process_token. Returns the pointer just past the
- * closing quote, or NULL if the string is unterminated. */
+ * and feeds each token to `handle`. Returns the pointer just past the closing
+ * quote, or NULL if the string is unterminated. */
 static const char *scan_name_value(const char *p,
-                                   const char *domain_lc, size_t dlen,
+                                   crtsh_token_fn handle, void *ctx,
                                    char *out, size_t cap, size_t *olen, int *count)
 {
     p++; /* skip opening quote */
@@ -121,7 +178,7 @@ static const char *scan_name_value(const char *p,
             }
             if (*p == 'n') {
                 /* Decoded newline: split here. */
-                process_token(tok, tlen, domain_lc, dlen, out, cap, olen, count);
+                handle(tok, tlen, ctx, out, cap, olen, count);
                 tlen = 0;
                 p++;
                 continue;
@@ -142,17 +199,48 @@ static const char *scan_name_value(const char *p,
         if (tlen < CRTSH_NAME_MAX) {
             tok[tlen++] = c;
         }
-        /* Overlong tokens are silently capped; they cannot match a domain. */
+        /* Overlong tokens are silently capped; they cannot match. */
         p++;
     }
 
     /* Finalize the trailing token. */
-    process_token(tok, tlen, domain_lc, dlen, out, cap, olen, count);
+    handle(tok, tlen, ctx, out, cap, olen, count);
 
     if (*p != '"') {
         return NULL; /* unterminated string */
     }
     return p + 1;
+}
+
+/* Walk every "name_value" key in `json`, feeding each value to `handle`.
+ * Returns 1 if at least one "name_value" key was seen, 0 otherwise. */
+static int scan_all_name_values(const char *json, crtsh_token_fn handle, void *ctx,
+                                char *out, size_t cap, int *count)
+{
+    size_t olen = 0;
+    int found = 0;
+
+    const char *p = json;
+    while ((p = strstr(p, "\"name_value\"")) != NULL) {
+        found = 1;
+        const char *after = p + strlen("\"name_value\"");
+
+        /* Walk from the key to the value's opening quote, stopping early if the
+         * value is not a string (e.g. null). */
+        const char *q = after;
+        while (*q != '\0' && *q != '"' && *q != '}' && *q != ',') {
+            q++;
+        }
+        if (*q != '"') {
+            p = after;
+            continue;
+        }
+
+        const char *endp = scan_name_value(q, handle, ctx, out, cap, &olen, count);
+        p = (endp != NULL) ? endp : after;
+    }
+
+    return found;
 }
 
 int alosint_crtsh_extract_unique(const char *json_str, const char *domain,
@@ -177,32 +265,30 @@ int alosint_crtsh_extract_unique(const char *json_str, const char *domain,
     }
     domain_lc[dlen] = '\0';
 
-    size_t cap = (size_t)max_len;
-    size_t olen = 0;
+    struct domain_ctx ctx = { domain_lc, dlen };
     int count = 0;
-    int found = 0;
+    int found = scan_all_name_values(json_str, process_domain_token, &ctx,
+                                     out_buf, (size_t)max_len, &count);
+    if (!found) {
+        return -1;
+    }
+    return count;
+}
 
-    const char *p = json_str;
-    while ((p = strstr(p, "\"name_value\"")) != NULL) {
-        found = 1;
-        const char *after = p + strlen("\"name_value\"");
+int alosint_crtsh_extract_emails(const char *json_str, char *out_buf, int max_len)
+{
+    if (out_buf == NULL || max_len <= 0) {
+        return -1;
+    }
+    out_buf[0] = '\0';
 
-        /* Walk from the key to the value's opening quote, stopping early if the
-         * value is not a string (e.g. null). */
-        const char *q = after;
-        while (*q != '\0' && *q != '"' && *q != '}' && *q != ',') {
-            q++;
-        }
-        if (*q != '"') {
-            p = after;
-            continue;
-        }
-
-        const char *endp = scan_name_value(q, domain_lc, dlen,
-                                           out_buf, cap, &olen, &count);
-        p = (endp != NULL) ? endp : after;
+    if (json_str == NULL || json_str[0] == '\0') {
+        return -1;
     }
 
+    int count = 0;
+    int found = scan_all_name_values(json_str, process_email_token, NULL,
+                                     out_buf, (size_t)max_len, &count);
     if (!found) {
         return -1;
     }
