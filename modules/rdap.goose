@@ -95,3 +95,60 @@ fn summary(json: const u8[:], out_buf: u8[>..]&) {
 fn format_summary(json: const u8[:], out_buf: u8[>..]&) {
     summary(json, out_buf);
 }
+
+// Bind the C symbol:
+//     int alosint_rdap_lookup_ip(const char *ip, char *json_out, int max_len);
+extern fn alosint_rdap_lookup_ip(ip: u8&, json_out: u8&, max_len: i32) -> i32;
+
+fn lookup_ip(ip: const u8[:], out_buf: u8[>..]&) -> bool {
+    var name: u8[>..] = [];
+    for i: i64 in 0..ip.len {
+        name.push(ip[i]);
+    }
+    name.push(0);
+
+    var json: u8[>..] = [];
+    for i: i32 in 0..RDAP_CAP {
+        json.push(0);
+    }
+
+    let rc = alosint_rdap_lookup_ip(name[0], json[0], RDAP_CAP);
+    if rc != 0 {
+        return false;
+    }
+
+    for i: i64 in 0..json.len {
+        if json[i] == 0 {
+            break;
+        }
+        out_buf.push(json[i]);
+    }
+    true
+}
+
+// Bind the C symbol:
+//     void alosint_extract_rdap_ip_summary(const char *json_str,
+//                                          char *out_buf, int max_len);
+extern fn alosint_extract_rdap_ip_summary(json_str: u8&, out_buf: u8&, max_len: i32);
+
+fn format_ip_summary(json: const u8[:], out_buf: u8[>..]&) {
+    var src: u8[>..] = [];
+    for i: i64 in 0..json.len {
+        src.push(json[i]);
+    }
+    src.push(0);
+
+    var buf: u8[>..] = [];
+    for i: i32 in 0..SUMMARY_CAP {
+        buf.push(0);
+    }
+
+    alosint_extract_rdap_ip_summary(src[0], buf[0], SUMMARY_CAP);
+
+    for i: i64 in 0..buf.len {
+        if buf[i] == 0 {
+            break;
+        }
+        out_buf.push(buf[i]);
+    }
+}

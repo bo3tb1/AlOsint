@@ -16,11 +16,13 @@ let HELP = """
     Usage:
       alosint -d <domain> [--rdap] [--subdomains] [--subdomains-raw] [--json] [--tor] [--output <file>] [--quiet]
       alosint --email <email> [--json] [--tor] [--output <file>] [--quiet]
+      alosint --ip <ip> [--json] [--tor] [--output <file>] [--quiet]
       alosint -h | --help
 
     Options:
       -d, --domain <domain>  Target domain to investigate
           --email <email>    Search Certificate Transparency for an email address
+          --ip <ip>          Retrieve RDAP network summary for an IP address
           --rdap             Retrieve RDAP registration summary
           --subdomains       Print unique subdomains discovered via crt.sh
           --subdomains-raw   Print raw crt.sh JSON
@@ -45,6 +47,7 @@ struct Config {
     subdomains_raw: bool,
     quiet: bool,
     email_mode: bool,
+    ip_mode: bool,
     target: u8[],
     output: u8[>..],
 }
@@ -85,6 +88,7 @@ fn parse_args() -> Config {
     let argv = args();
     var domain: u8[>..] = [];
     var email: u8[>..] = [];
+    var ip: u8[>..] = [];
     var output: u8[>..] = [];
     var json = false;
     var tor = false;
@@ -118,6 +122,16 @@ fn parse_args() -> Config {
             i++;
             if argv[i].len == 0 { usage_error("email must not be empty"); }
             email.append(argv[i]);
+        } else if a == "--ip" {
+            if i + 1 >= argv.len || (argv[i + 1].len > 0 && argv[i + 1][0] == '-') {
+                usage_error(str("missing value for ", a));
+            }
+            if ip.len > 0 {
+                usage_error("ip specified more than once");
+            }
+            i++;
+            if argv[i].len == 0 { usage_error("ip must not be empty"); }
+            ip.append(argv[i]);
         } else if a == "--output" || a == "-o" {
             if i + 1 >= argv.len || (argv[i + 1].len > 0 && argv[i + 1][0] == '-') {
                 usage_error(str("missing value for ", a));
@@ -155,13 +169,22 @@ fn parse_args() -> Config {
     if domain.len > 0 && email.len > 0 {
         usage_error("-d/--domain and --email are mutually exclusive");
     }
-    if domain.len == 0 && email.len == 0 {
-        usage_error("missing required -d/--domain or --email");
+    if ip.len > 0 && domain.len > 0 {
+        usage_error("--ip and -d/--domain are mutually exclusive");
+    }
+    if ip.len > 0 && email.len > 0 {
+        usage_error("--ip and --email are mutually exclusive");
+    }
+    if domain.len == 0 && email.len == 0 && ip.len == 0 {
+        usage_error("missing required -d/--domain, --email, or --ip");
+    }
+    if ip.len > 0 {
+        return Config { json: json, tor: tor, rdap: rdap, subdomains: subdomains, subdomains_raw: subdomains_raw, quiet: quiet, email_mode: false, ip_mode: true, target: copy(ip), output: copy(output) };
     }
     if email.len > 0 {
-        return Config { json: json, tor: tor, rdap: rdap, subdomains: subdomains, subdomains_raw: subdomains_raw, quiet: quiet, email_mode: true, target: copy(email), output: copy(output) };
+        return Config { json: json, tor: tor, rdap: rdap, subdomains: subdomains, subdomains_raw: subdomains_raw, quiet: quiet, email_mode: true, ip_mode: false, target: copy(email), output: copy(output) };
     }
-    return Config { json: json, tor: tor, rdap: rdap, subdomains: subdomains, subdomains_raw: subdomains_raw, quiet: quiet, email_mode: false, target: copy(domain), output: copy(output) };
+    return Config { json: json, tor: tor, rdap: rdap, subdomains: subdomains, subdomains_raw: subdomains_raw, quiet: quiet, email_mode: false, ip_mode: false, target: copy(domain), output: copy(output) };
 }
 
 fn find_from(s: const u8[:], start: i64, needle: const u8[:]) -> i64 {
@@ -255,6 +278,67 @@ fn main() {
                     }
                     i++;
                 }
+            }
+        }
+        write_output(cfg);
+        return;
+    }
+
+    if cfg.ip_mode {
+        var ip_rdap: u8[>..] = [];
+        let ip_ok = rdap::lookup_ip(cfg.target, ip_rdap);
+        var ip_summary: u8[>..] = [];
+        if ip_ok {
+            rdap::format_ip_summary(ip_rdap, ip_summary);
+        }
+
+        if cfg.json {
+            var out: u8[>..] = [];
+            out.append("{\"ip\":\"");
+            json_writer::escape(cfg.target, out);
+            out.append("\",\"rdap\":");
+            if ip_ok {
+                let network_prefix = "Network: ";
+                let range_sep = " | Range: ";
+                let country_sep = " | Country: ";
+                let type_sep = " | Type: ";
+                let n_start = find_from(ip_summary, 0, network_prefix);
+                let r_sep = find_from(ip_summary, 0, range_sep);
+                let c_sep = find_from(ip_summary, 0, country_sep);
+                let t_sep = find_from(ip_summary, 0, type_sep);
+                if n_start >= 0
+                    && r_sep >= n_start + network_prefix.len
+                    && c_sep >= r_sep + range_sep.len
+                    && t_sep >= c_sep + country_sep.len
+                    && ip_summary.len >= t_sep + type_sep.len {
+                    let n_begin = n_start + network_prefix.len;
+                    let r_begin = r_sep + range_sep.len;
+                    let c_begin = c_sep + country_sep.len;
+                    let t_begin = t_sep + type_sep.len;
+                    out.append("{\"network\":\"");
+                    json_writer::escape(ip_summary[n_begin..r_sep], out);
+                    out.append("\",\"range\":\"");
+                    json_writer::escape(ip_summary[r_begin..c_sep], out);
+                    out.append("\",\"country\":\"");
+                    json_writer::escape(ip_summary[c_begin..t_sep], out);
+                    out.append("\",\"type\":\"");
+                    json_writer::escape(ip_summary[t_begin..ip_summary.len], out);
+                    out.append("\"}");
+                } else {
+                    out.append("{\"network\":\"");
+                    json_writer::escape(ip_summary, out);
+                    out.append("\",\"range\":\"Unknown\",\"country\":\"Unknown\",\"type\":\"Unknown\"}");
+                }
+            } else {
+                out.append("null,\"rdap_error\":\"lookup failed\"");
+            }
+            out.push('}');
+            emit(cfg, out);
+        } else if !cfg.quiet {
+            if ip_ok {
+                emit(cfg, str(cfg.target, " RDAP Summary: ", ip_summary));
+            } else {
+                emit(cfg, str(cfg.target, " RDAP lookup failed"));
             }
         }
         write_output(cfg);
