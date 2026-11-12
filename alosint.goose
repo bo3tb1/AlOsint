@@ -4,6 +4,9 @@ import modules.dns;
 import modules.json_writer;
 import modules.rdap;
 
+extern fn alosint_set_tor(enabled: i32);
+extern fn alosint_get_tor() -> i32;
+
 let HELP = """
     AlOsint 1.0.0 - passive OSINT for authorized targets
 
@@ -17,7 +20,7 @@ let HELP = """
           --subdomains       Print unique subdomains discovered via crt.sh
           --subdomains-raw   Print raw crt.sh JSON
           --json             Emit one unified JSON object
-          --tor              Route HTTP(S) through a local SOCKS5 proxy
+          --tor              Route HTTP(S) through a local SOCKS5 proxy at 127.0.0.1:9050 (DNS is not proxied).
       -h, --help             Print this help and exit
 
     Legal:
@@ -110,55 +113,66 @@ fn find_from(s: const u8[:], start: i64, needle: const u8[:]) -> i64 {
 
 fn main() {
     let cfg = parse_args();
+    if cfg.tor {
+        alosint_set_tor(1);
+    }
 
     var ip: u8[>..] = [];
-    let dns_ok = dns::lookup(cfg.domain, ip);
+    var dns_ok = dns::lookup(cfg.domain, ip);
+
+    var rdap_data: u8[>..] = [];
+    var rdap_ok = false;
+    var rdap_summary: u8[>..] = [];
+    if cfg.rdap {
+        rdap_ok = rdap::lookup(cfg.domain, rdap_data);
+        if rdap_ok {
+            rdap::format_summary(rdap_data, rdap_summary);
+        }
+    }
+
+    var crtsh_raw: u8[>..] = [];
+    var crtsh_ok = false;
+    var sub_names: u8[>..] = [];
+    var sub_count: i32 = 0;
+    if cfg.subdomains || cfg.subdomains_raw {
+        crtsh_ok = crtsh::lookup(cfg.domain, crtsh_raw);
+        if crtsh_ok && cfg.subdomains {
+            sub_count = crtsh::summary(crtsh_raw, cfg.domain, sub_names);
+        }
+    }
+
     if !cfg.json {
         if dns_ok {
             print(cfg.domain, " resolves to: ", ip);
         } else {
             print(cfg.domain, " could not be resolved");
         }
-    }
 
-    var rdap_summary: u8[>..] = [];
-    var rdap_ok = false;
-    if cfg.rdap {
-        var rdap_data: u8[>..] = [];
-        if rdap::lookup(cfg.domain, rdap_data) {
-            rdap::format_summary(rdap_data, rdap_summary);
-            rdap_ok = true;
-            if !cfg.json {
+        if cfg.rdap {
+            if rdap_ok {
                 print("RDAP Summary for ", cfg.domain, ": ", rdap_summary);
+            } else {
+                print("RDAP Data for ", cfg.domain, " could not be retrieved");
             }
-        } else if !cfg.json {
-            print("RDAP Data for ", cfg.domain, " could not be retrieved");
         }
-    }
 
-    var crtsh_raw: u8[>..] = [];
-    var names: u8[>..] = [];
-    var name_count: i32 = 0;
-    if cfg.subdomains || cfg.subdomains_raw {
-        if crtsh::lookup(cfg.domain, crtsh_raw) {
-            if cfg.subdomains || cfg.json {
-                name_count = crtsh::summary(crtsh_raw, cfg.domain, names);
+        if cfg.subdomains {
+            if !crtsh_ok {
+                print(cfg.domain, " subdomain lookup failed");
+            } else if sub_count > 0 {
+                print("\nUnique subdomains (", sub_count, "):\n");
+                print(sub_names);
+            } else {
+                print("No subdomains found.");
             }
-            if !cfg.json {
-                if cfg.subdomains {
-                    if name_count > 0 {
-                        print("\nUnique subdomains (", name_count, "):\n");
-                        print(names);
-                    } else {
-                        print("No subdomains found.");
-                    }
-                }
-                if cfg.subdomains_raw {
-                    print(crtsh_raw);
-                }
+        }
+
+        if cfg.subdomains_raw {
+            if crtsh_ok {
+                print(crtsh_raw);
+            } else if !cfg.subdomains {
+                print(cfg.domain, " subdomain lookup failed");
             }
-        } else if !cfg.json {
-            print(cfg.domain, " subdomain lookup failed");
         }
     }
 
@@ -176,54 +190,78 @@ fn main() {
         }
 
         out.append(",\"rdap\":");
-        if rdap_ok {
-            let sep = find_from(rdap_summary, 0, " | Registered: ");
-            let prefix = "Registrar: ";
-            var reg_start: i64 = 0;
-            if find_from(rdap_summary, 0, prefix) == 0 {
-                reg_start = prefix.len;
-            }
-            let reg_end = if sep >= 0 { sep } else { rdap_summary.len };
-            let date_start = if sep >= 0 { sep + " | Registered: ".len } else { rdap_summary.len };
-
-            out.append("{\"registrar\":\"");
-            if reg_start <= reg_end {
-                json_writer::escape(rdap_summary[reg_start..reg_end], out);
-            }
-            out.append("\",\"registered\":\"");
-            if date_start <= rdap_summary.len {
-                json_writer::escape(rdap_summary[date_start..rdap_summary.len], out);
-            }
-            out.append("\"}");
-        } else {
-            out.append("null");
-        }
-
-        out.append(",\"subdomains\":");
-        if name_count > 0 {
-            out.push('[');
-            var start: i64 = 0;
-            var first = true;
-            var i: i64 = 0;
-            while i <= names.len {
-                if i == names.len || names[i] == '\n' {
-                    if i > start {
-                        if !first {
-                            out.push(',');
-                        }
-                        first = false;
-                        out.push('"');
-                        json_writer::escape(names[start..i], out);
-                        out.push('"');
+        if cfg.rdap {
+            if rdap_ok {
+                let sep = find_from(rdap_summary, 0, " | ");
+                let reg_prefix = "Registrar: ";
+                let date_prefix = "Registered: ";
+                var matched = false;
+                if sep >= 0 && find_from(rdap_summary, 0, reg_prefix) == 0 {
+                    if find_from(rdap_summary, sep + 3, date_prefix) == sep + 3 {
+                        matched = true;
                     }
-                    start = i + 1;
                 }
-                i++;
+                if matched {
+                    out.append("{\"registrar\":\"");
+                    json_writer::escape(rdap_summary[reg_prefix.len..sep], out);
+                    out.append("\",\"registered\":\"");
+                    let date_start = sep + 3 + date_prefix.len;
+                    json_writer::escape(rdap_summary[date_start..rdap_summary.len], out);
+                    out.append("\"}");
+                } else {
+                    out.push('"');
+                    json_writer::escape(rdap_summary, out);
+                    out.push('"');
+                }
+            } else {
+                out.append("null,\"rdap_error\":\"lookup failed\"");
             }
-            out.push(']');
         } else {
             out.append("null");
         }
+
+        if cfg.subdomains {
+            out.append(",\"subdomains\":");
+            if !crtsh_ok {
+                out.append("null,\"subdomains_error\":\"lookup failed\"");
+            } else if sub_count > 0 {
+                out.push('[');
+                var start: i64 = 0;
+                var first = true;
+                var i: i64 = 0;
+                while i <= sub_names.len {
+                    if i == sub_names.len || sub_names[i] == '\n' {
+                        if i > start {
+                            if !first {
+                                out.push(',');
+                            }
+                            first = false;
+                            out.push('"');
+                            json_writer::escape(sub_names[start..i], out);
+                            out.push('"');
+                        }
+                        start = i + 1;
+                    }
+                    i++;
+                }
+                out.push(']');
+            } else {
+                out.append("[]");
+            }
+        }
+
+        if cfg.subdomains_raw {
+            out.append(",\"subdomains_raw\":");
+            if crtsh_ok {
+                out.append(crtsh_raw);
+            } else {
+                out.append("null");
+                if !cfg.subdomains {
+                    out.append(",\"subdomains_error\":\"lookup failed\"");
+                }
+            }
+        }
+
         out.push('}');
         print(out);
     }
