@@ -29,14 +29,32 @@ On Debian/Ubuntu, the native dependencies can be installed with:
 sudo apt install gcc libcurl4-openssl-dev
 ```
 
-### Build
+### Build and install with make
 
 From the repository root:
 
 ```sh
-goose check alosint.goose
-goose build alosint.goose --cc gcc -o alosint
+make
+sudo make install
 ```
+
+`make` builds `./alosint`, and `sudo make install` copies it to `/usr/local/bin/alosint`. Use `make test` to run the Goose compiler check, and `make clean` to remove the binary and object files.
+
+If `goose` is not in your `PATH`, pass its location explicitly:
+
+```sh
+make GOOSE=/path/to/goose
+```
+
+### Fallback installer (without make)
+
+If `make` is unavailable, use the included installer. It checks for `goose` and `gcc`, builds the binary, and installs it to `/usr/local/bin` when permitted (using `sudo` if needed). Otherwise, it installs to `$HOME/.local/bin`:
+
+```sh
+./install.sh
+```
+
+If AlOsint is installed under `$HOME/.local/bin`, ensure that directory is in your `PATH`.
 
 ## Usage
 
