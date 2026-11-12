@@ -8,7 +8,12 @@ namespace crtsh;
 //     int alosint_crtsh_lookup(const char *domain, char *json_out, int max_len);
 extern fn alosint_crtsh_lookup(domain: u8&, json_out: u8&, max_len: i32) -> i32;
 
-let CRTSH_CAP: i32 = 262144;
+// Fixed capacity of the Goose-owned buffer lent to the C fetch shim, in bytes.
+// crt.sh JSON for busy domains is large (e.g. google.com ~0.5 MB), so 256 KiB
+// silently truncated it. 16 MiB gives generous headroom; the C side bounds its
+// writes to this cap, so a response larger than it is still truncated (a fixed
+// buffer, not dynamic growth — see Step 11 discussion).
+let CRTSH_CAP: i32 = 16777216;
 
 // lookup fetches the raw crt.sh JSON for `domain` and appends it to `out_buf`.
 // Returns true on success, false on any transport or HTTP failure.
