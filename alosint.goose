@@ -281,6 +281,9 @@ fn main() {
             }
         }
         write_output(cfg);
+        if !email_ok {
+            exit(1);
+        }
         return;
     }
 
@@ -342,6 +345,9 @@ fn main() {
             }
         }
         write_output(cfg);
+        if !ip_ok {
+            exit(1);
+        }
         return;
     }
 
@@ -367,6 +373,14 @@ fn main() {
         if crtsh_ok && cfg.subdomains {
             sub_count = crtsh::summary(crtsh_raw, cfg.target, sub_names);
         }
+    }
+
+    var lookup_failed = false;
+    if cfg.rdap && !rdap_ok {
+        lookup_failed = true;
+    }
+    if (cfg.subdomains || cfg.subdomains_raw) && !crtsh_ok {
+        lookup_failed = true;
     }
 
     if !cfg.json && !cfg.quiet {
@@ -494,4 +508,7 @@ fn main() {
         emit(cfg, out);
     }
     write_output(cfg);
+    if lookup_failed {
+        exit(1);
+    }
 }
