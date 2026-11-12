@@ -186,6 +186,13 @@ static int rdap_prereq_cb(void *clientp,
     (void)conn_primary_port;
     (void)conn_local_port;
 
+    /* socks5h tunnels the destination hostname to Tor, which resolves it
+     * internally. We cannot meaningfully check the destination IP here, and the
+     * user explicitly opted into --tor for privacy. */
+    if (alosint_get_tor()) {
+        return CURL_PREREQFUNC_OK;
+    }
+
     /* No IP string, or a private/unparseable one: refuse (fail closed). */
     if (conn_primary_ip == NULL || rdap_ip_is_private(conn_primary_ip)) {
         return CURL_PREREQFUNC_ABORT;
