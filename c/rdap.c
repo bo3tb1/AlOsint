@@ -201,21 +201,12 @@ static int rdap_prereq_cb(void *clientp,
 }
 #endif /* libcurl >= 7.80.0 */
 
-int alosint_rdap_lookup(const char *domain, char *json_out, int max_len)
+/* Shared HTTPS GET of `url` into json_out (bounded). Identical, hardened curl
+ * options for every RDAP caller: Tor proxy (fail-closed), TLS verification,
+ * HTTPS-only for request and redirects, and the SSRF prereq guard. Returns 0,
+ * -1 (transport/bad arguments), or -2 (HTTP error). */
+static int rdap_perform(const char *url, char *json_out, int max_len)
 {
-    if (domain == NULL || json_out == NULL || max_len <= 0) {
-        return -1;
-    }
-
-    /* Never leave the output uninitialized for callers that ignore the code. */
-    json_out[0] = '\0';
-
-    /* Validate before interpolating into the URL (defends against URL
-     * injection). Invalid input is a client/transport error. */
-    if (!rdap_valid_domain(domain)) {
-        return -1;
-    }
-
 #ifdef RDAP_HAVE_PREREQ
     /* Fail closed if the running libcurl is too old to install the SSRF guard
      * the compiled code relies on. */
@@ -226,12 +217,6 @@ int alosint_rdap_lookup(const char *domain, char *json_out, int max_len)
         }
     }
 #endif
-
-    char url[600];
-    int n = snprintf(url, sizeof(url), "https://rdap.org/domain/%s", domain);
-    if (n < 0 || (size_t)n >= sizeof(url)) {
-        return -1; /* domain too long to form a bounded URL */
-    }
 
     CURL *curl = curl_easy_init();
     if (curl == NULL) {
@@ -310,4 +295,54 @@ int alosint_rdap_lookup(const char *domain, char *json_out, int max_len)
         return -2;
     }
     return 0;
+}
+
+int alosint_rdap_lookup(const char *domain, char *json_out, int max_len)
+{
+    if (domain == NULL || json_out == NULL || max_len <= 0) {
+        return -1;
+    }
+
+    /* Never leave the output uninitialized for callers that ignore the code. */
+    json_out[0] = '\0';
+
+    /* Validate before interpolating into the URL (defends against URL
+     * injection). Invalid input is a client/transport error. */
+    if (!rdap_valid_domain(domain)) {
+        return -1;
+    }
+
+    char url[600];
+    int n = snprintf(url, sizeof(url), "https://rdap.org/domain/%s", domain);
+    if (n < 0 || (size_t)n >= sizeof(url)) {
+        return -1; /* domain too long to form a bounded URL */
+    }
+
+    return rdap_perform(url, json_out, max_len);
+}
+
+int alosint_rdap_lookup_ip(const char *ip, char *json_out, int max_len)
+{
+    if (ip == NULL || json_out == NULL || max_len <= 0) {
+        return -1;
+    }
+
+    json_out[0] = '\0';
+
+    /* Validate as an IPv4 or IPv6 literal. This rejects junk and, because a
+     * valid literal contains only [0-9a-fA-F:.], prevents URL injection via the
+     * path segment. */
+    struct in_addr  v4;
+    struct in6_addr v6;
+    if (inet_pton(AF_INET, ip, &v4) != 1 && inet_pton(AF_INET6, ip, &v6) != 1) {
+        return -1;
+    }
+
+    char url[600];
+    int n = snprintf(url, sizeof(url), "https://rdap.org/ip/%s", ip);
+    if (n < 0 || (size_t)n >= sizeof(url)) {
+        return -1;
+    }
+
+    return rdap_perform(url, json_out, max_len);
 }

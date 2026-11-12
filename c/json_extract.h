@@ -24,4 +24,17 @@
  */
 void alosint_extract_rdap_summary(const char *json_str, char *out_buf, int max_len);
 
+/*
+ * alosint_extract_rdap_ip_summary — distill an RDAP *IP* JSON document into a
+ * one-line summary:
+ *
+ *     Network: <name> | Range: <start>-<end> | Country: <cc> | Type: <type>
+ *
+ * Fields come from the top-level "name" (falling back to "handle"),
+ * "startAddress", "endAddress", "country", and "type". Missing fields render as
+ * "Unknown". Always NUL-terminated; writes never exceed max_len. On NULL/empty
+ * input it writes an all-"Unknown" summary.
+ */
+void alosint_extract_rdap_ip_summary(const char *json_str, char *out_buf, int max_len);
+
 #endif /* ALOSINT_JSON_EXTRACT_H */

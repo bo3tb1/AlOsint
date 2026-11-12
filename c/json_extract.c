@@ -206,3 +206,119 @@ void alosint_extract_rdap_summary(const char *json_str, char *out_buf, int max_l
     snprintf(out_buf, (size_t)max_len, "Registrar: %s | Registered: %s",
              registrar, date);
 }
+
+/* Extract the string value of a TOP-LEVEL key `key` (a direct member of the
+ * root object, nesting depth 1) into `dst`. Returns 1 on success.
+ *
+ * Depth awareness matters: RDAP documents repeat common keys like "type" and
+ * "name" inside nested "links"/"notices"/"entities" arrays (e.g. a link's media
+ * type "application/rdap+json"), so a naive first-match would grab the wrong
+ * one. We track object/array nesting, skip over string contents, and only
+ * consider a key when it sits directly in the root object. */
+static int extract_string_field(const char *json, const char *key,
+                                char *dst, size_t cap)
+{
+    size_t keylen = strlen(key);
+    int depth = 0;
+
+    const char *p = json;
+    while (*p != '\0') {
+        char c = *p;
+
+        if (c == '"') {
+            /* Span the whole string literal so its bytes never affect depth. */
+            const char *s = p;
+            const char *q = p + 1;
+            while (*q != '\0' && *q != '"') {
+                if (*q == '\\' && q[1] != '\0') {
+                    q += 2;
+                } else {
+                    q++;
+                }
+            }
+            if (*q != '"') {
+                return 0; /* unterminated string */
+            }
+
+            const char *after = q + 1;
+            const char *t = after;
+            while (*t == ' ' || *t == '\t' || *t == '\n' || *t == '\r') {
+                t++;
+            }
+
+            /* A key is a string immediately followed by ':'. */
+            if (*t == ':' && depth == 1) {
+                size_t slen = (size_t)(q - (s + 1));
+                if (slen == keylen && memcmp(s + 1, key, keylen) == 0) {
+                    const char *v = t + 1;
+                    while (*v == ' ' || *v == '\t' || *v == '\n' || *v == '\r') {
+                        v++;
+                    }
+                    if (*v != '"') {
+                        return 0; /* value is not a string */
+                    }
+                    return copy_json_string(v, dst, cap) != NULL && dst[0] != '\0';
+                }
+            }
+
+            p = after;
+            continue;
+        }
+
+        if (c == '{' || c == '[') {
+            depth++;
+        } else if (c == '}' || c == ']') {
+            if (depth > 0) {
+                depth--;
+            }
+        }
+        p++;
+    }
+
+    return 0;
+}
+
+void alosint_extract_rdap_ip_summary(const char *json_str, char *out_buf, int max_len)
+{
+    if (out_buf == NULL || max_len <= 0) {
+        return;
+    }
+    out_buf[0] = '\0';
+
+    char name[128];
+    char start[64];
+    char end[64];
+    char country[16];
+    char type[64];
+    name[0] = start[0] = end[0] = country[0] = type[0] = '\0';
+
+    if (json_str != NULL) {
+        /* Network identifier: prefer "name", fall back to the registry "handle". */
+        if (!extract_string_field(json_str, "name", name, sizeof(name)) &&
+            !extract_string_field(json_str, "handle", name, sizeof(name))) {
+            name[0] = '\0';
+        }
+        if (!extract_string_field(json_str, "startAddress", start, sizeof(start))) {
+            start[0] = '\0';
+        }
+        if (!extract_string_field(json_str, "endAddress", end, sizeof(end))) {
+            end[0] = '\0';
+        }
+        if (!extract_string_field(json_str, "country", country, sizeof(country))) {
+            country[0] = '\0';
+        }
+        if (!extract_string_field(json_str, "type", type, sizeof(type))) {
+            type[0] = '\0';
+        }
+    }
+
+    if (name[0] == '\0')    { snprintf(name, sizeof(name), "Unknown"); }
+    if (start[0] == '\0')   { snprintf(start, sizeof(start), "Unknown"); }
+    if (end[0] == '\0')     { snprintf(end, sizeof(end), "Unknown"); }
+    if (country[0] == '\0') { snprintf(country, sizeof(country), "Unknown"); }
+    if (type[0] == '\0')    { snprintf(type, sizeof(type), "Unknown"); }
+
+    snprintf(out_buf, (size_t)max_len,
+             "Network: %s | Range: %s-%s | Country: %s | Type: %s",
+             name, start, end, country, type);
+}
