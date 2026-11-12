@@ -12,10 +12,12 @@ let HELP = """
 
     Usage:
       alosint -d <domain> [--rdap] [--subdomains] [--subdomains-raw] [--json] [--tor]
+      alosint --email <email> [--json] [--tor]
       alosint -h | --help
 
     Options:
-      -d, --domain <domain>  Target domain to investigate (required)
+      -d, --domain <domain>  Target domain to investigate
+          --email <email>    Search Certificate Transparency for an email address
           --rdap             Retrieve RDAP registration summary
           --subdomains       Print unique subdomains discovered via crt.sh
           --subdomains-raw   Print raw crt.sh JSON
@@ -36,7 +38,8 @@ struct Config {
     rdap: bool,
     subdomains: bool,
     subdomains_raw: bool,
-    domain: u8[>..],
+    email_mode: bool,
+    target: u8[>..],
 }
 
 fn usage_error(msg: const u8[:]) {
@@ -48,6 +51,7 @@ fn usage_error(msg: const u8[:]) {
 fn parse_args() -> Config {
     let argv = args();
     var domain: u8[>..] = [];
+    var email: u8[>..] = [];
     var json = false;
     var tor = false;
     var rdap = false;
@@ -69,6 +73,16 @@ fn parse_args() -> Config {
             i++;
             if argv[i].len == 0 { usage_error("domain must not be empty"); }
             domain.append(argv[i]);
+        } else if a == "--email" {
+            if i + 1 >= argv.len || (argv[i + 1].len > 0 && argv[i + 1][0] == '-') {
+                usage_error(str("missing value for ", a));
+            }
+            if email.len > 0 {
+                usage_error("email specified more than once");
+            }
+            i++;
+            if argv[i].len == 0 { usage_error("email must not be empty"); }
+            email.append(argv[i]);
         } else if a == "--json" {
             json = true;
         } else if a == "--tor" {
@@ -84,8 +98,16 @@ fn parse_args() -> Config {
         }
         i++;
     }
-    if domain.len == 0 { usage_error("missing required -d/--domain"); }
-    return Config { json: json, tor: tor, rdap: rdap, subdomains: subdomains, subdomains_raw: subdomains_raw, domain: domain };
+    if domain.len > 0 && email.len > 0 {
+        usage_error("-d/--domain and --email are mutually exclusive");
+    }
+    if domain.len == 0 && email.len == 0 {
+        usage_error("missing required -d/--domain or --email");
+    }
+    if email.len > 0 {
+        return Config { json: json, tor: tor, rdap: rdap, subdomains: subdomains, subdomains_raw: subdomains_raw, email_mode: true, target: email };
+    }
+    return Config { json: json, tor: tor, rdap: rdap, subdomains: subdomains, subdomains_raw: subdomains_raw, email_mode: false, target: domain };
 }
 
 fn find_from(s: const u8[:], start: i64, needle: const u8[:]) -> i64 {
@@ -117,14 +139,81 @@ fn main() {
         alosint_set_tor(1);
     }
 
+    if cfg.email_mode {
+        var email_raw: u8[>..] = [];
+        let email_ok = crtsh::lookup_email(cfg.target, email_raw);
+        var email_names: u8[>..] = [];
+        var email_count: i32 = 0;
+        if email_ok {
+            email_count = crtsh::summary_emails(email_raw, email_names);
+            if email_count < 0 {
+                email_count = 0;
+            }
+        }
+
+        if cfg.json {
+            var out: u8[>..] = [];
+            out.append("{\"email\":\"");
+            json_writer::escape(cfg.target, out);
+            out.append("\",\"entries\":");
+            if !email_ok {
+                out.append("null,\"entries_error\":\"lookup failed\"");
+            } else if email_count > 0 {
+                out.push('[');
+                var start: i64 = 0;
+                var first = true;
+                var i: i64 = 0;
+                while i <= email_names.len {
+                    if i == email_names.len || email_names[i] == '\n' {
+                        if i > start {
+                            if !first {
+                                out.push(',');
+                            }
+                            first = false;
+                            out.push('"');
+                            json_writer::escape(email_names[start..i], out);
+                            out.push('"');
+                        }
+                        start = i + 1;
+                    }
+                    i++;
+                }
+                out.push(']');
+            } else {
+                out.append("[]");
+            }
+            out.push('}');
+            print(out);
+        } else {
+            if !email_ok {
+                print(cfg.target, " email lookup failed");
+            } else {
+                print(cfg.target, " found in Certificate Transparency:");
+                print("Unique entries (", email_count, "):");
+                var start: i64 = 0;
+                var i: i64 = 0;
+                while i <= email_names.len {
+                    if i == email_names.len || email_names[i] == '\n' {
+                        if i > start {
+                            print("  - ", email_names[start..i]);
+                        }
+                        start = i + 1;
+                    }
+                    i++;
+                }
+            }
+        }
+        return;
+    }
+
     var ip: u8[>..] = [];
-    var dns_ok = dns::lookup(cfg.domain, ip);
+    var dns_ok = dns::lookup(cfg.target, ip);
 
     var rdap_data: u8[>..] = [];
     var rdap_ok = false;
     var rdap_summary: u8[>..] = [];
     if cfg.rdap {
-        rdap_ok = rdap::lookup(cfg.domain, rdap_data);
+        rdap_ok = rdap::lookup(cfg.target, rdap_data);
         if rdap_ok {
             rdap::format_summary(rdap_data, rdap_summary);
         }
@@ -135,30 +224,30 @@ fn main() {
     var sub_names: u8[>..] = [];
     var sub_count: i32 = 0;
     if cfg.subdomains || cfg.subdomains_raw {
-        crtsh_ok = crtsh::lookup(cfg.domain, crtsh_raw);
+        crtsh_ok = crtsh::lookup(cfg.target, crtsh_raw);
         if crtsh_ok && cfg.subdomains {
-            sub_count = crtsh::summary(crtsh_raw, cfg.domain, sub_names);
+            sub_count = crtsh::summary(crtsh_raw, cfg.target, sub_names);
         }
     }
 
     if !cfg.json {
         if dns_ok {
-            print(cfg.domain, " resolves to: ", ip);
+            print(cfg.target, " resolves to: ", ip);
         } else {
-            print(cfg.domain, " could not be resolved");
+            print(cfg.target, " could not be resolved");
         }
 
         if cfg.rdap {
             if rdap_ok {
-                print("RDAP Summary for ", cfg.domain, ": ", rdap_summary);
+                print("RDAP Summary for ", cfg.target, ": ", rdap_summary);
             } else {
-                print("RDAP Data for ", cfg.domain, " could not be retrieved");
+                print("RDAP Data for ", cfg.target, " could not be retrieved");
             }
         }
 
         if cfg.subdomains {
             if !crtsh_ok {
-                print(cfg.domain, " subdomain lookup failed");
+                print(cfg.target, " subdomain lookup failed");
             } else if sub_count > 0 {
                 print("\nUnique subdomains (", sub_count, "):\n");
                 print(sub_names);
@@ -171,7 +260,7 @@ fn main() {
             if crtsh_ok {
                 print(crtsh_raw);
             } else if !cfg.subdomains {
-                print(cfg.domain, " subdomain lookup failed");
+                print(cfg.target, " subdomain lookup failed");
             }
         }
     }
@@ -179,7 +268,7 @@ fn main() {
     if cfg.json {
         var out: u8[>..] = [];
         out.append("{\"domain\":\"");
-        json_writer::escape(cfg.domain, out);
+        json_writer::escape(cfg.target, out);
         out.append("\",\"ip\":");
         if dns_ok {
             out.push('"');
