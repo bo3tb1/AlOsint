@@ -434,6 +434,19 @@ fn main() {
     if cfg.subdomains || cfg.subdomains_raw {
         vlog(cfg, str("CRTSH: GET https://crt.sh/?q=", cfg.target, "&output=json"));
         crtsh_ok = crtsh::lookup(cfg.target, crtsh_raw);
+        if crtsh_ok && crtsh_raw.len >= crtsh::CRTSH_CAP - 1 {
+            if cfg.json {
+                var out: u8[>..] = [];
+                out.append("{\"domain\":\"");
+                json_writer::escape(cfg.target, out);
+                out.append("\",\"subdomains\":null,\"subdomains_error\":\"response too large\"}");
+                emit(cfg, out);
+            } else if !cfg.quiet {
+                write_stderr("alosint: crt.sh response too large (>16 MiB)\n");
+            }
+            write_output(cfg);
+            exit(1);
+        }
         if crtsh_ok {
             vlog(cfg, str("CRTSH: parsed ", count_occurrences(crtsh_raw, "\"name_value\""), " certificates"));
         }
