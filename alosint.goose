@@ -6,13 +6,16 @@ import modules.rdap;
 
 extern fn alosint_set_tor(enabled: i32);
 extern fn alosint_get_tor() -> i32;
+extern fn alosint_write_file(path: u8&, data: u8&, len: i32) -> i32;
+
+var SINK: u8[>..] = [];
 
 let HELP = """
     AlOsint 1.0.0 - passive OSINT for authorized targets
 
     Usage:
-      alosint -d <domain> [--rdap] [--subdomains] [--subdomains-raw] [--json] [--tor]
-      alosint --email <email> [--json] [--tor]
+      alosint -d <domain> [--rdap] [--subdomains] [--subdomains-raw] [--json] [--tor] [--output <file>] [--quiet]
+      alosint --email <email> [--json] [--tor] [--output <file>] [--quiet]
       alosint -h | --help
 
     Options:
@@ -23,6 +26,8 @@ let HELP = """
           --subdomains-raw   Print raw crt.sh JSON
           --json             Emit one unified JSON object
           --tor              Route HTTP(S) through a local SOCKS5 proxy at 127.0.0.1:9050 (DNS is not proxied).
+      -o, --output <file>    Write output to a file instead of stdout
+      -q, --quiet            Suppress human-readable output
       -h, --help             Print this help and exit
 
     Legal:
@@ -38,8 +43,36 @@ struct Config {
     rdap: bool,
     subdomains: bool,
     subdomains_raw: bool,
+    quiet: bool,
     email_mode: bool,
-    target: u8[>..],
+    target: u8[],
+    output: u8[>..],
+}
+
+fn emit(cfg: Config&, msg: const u8[:]) {
+    if cfg.output.len == 0 {
+        print(msg);
+    } else {
+        SINK.append(msg);
+        SINK.push('\n');
+    }
+}
+
+fn write_output(cfg: Config&) {
+    if cfg.output.len == 0 {
+        return;
+    }
+    var path: u8[>..] = [];
+    for i: i64 in 0..cfg.output.len {
+        path.push(cfg.output[i]);
+    }
+    path.push(0);
+    SINK.push(0);
+    let rc = alosint_write_file(path[0], SINK[0], (SINK.len - 1) as i32);
+    if rc != 0 {
+        write_stderr(str("alosint: could not write output file: ", cfg.output, "\n"));
+        exit(1);
+    }
 }
 
 fn usage_error(msg: const u8[:]) {
@@ -52,11 +85,13 @@ fn parse_args() -> Config {
     let argv = args();
     var domain: u8[>..] = [];
     var email: u8[>..] = [];
+    var output: u8[>..] = [];
     var json = false;
     var tor = false;
     var rdap = false;
     var subdomains = false;
     var subdomains_raw = false;
+    var quiet = false;
     var i = 1;
     while i < argv.len {
         let a = argv[i];
@@ -83,6 +118,25 @@ fn parse_args() -> Config {
             i++;
             if argv[i].len == 0 { usage_error("email must not be empty"); }
             email.append(argv[i]);
+        } else if a == "--output" || a == "-o" {
+            if i + 1 >= argv.len || (argv[i + 1].len > 0 && argv[i + 1][0] == '-') {
+                usage_error(str("missing value for ", a));
+            }
+            if output.len > 0 {
+                usage_error("output specified more than once");
+            }
+            i++;
+            if argv[i].len == 0 { usage_error("output path must not be empty"); }
+            var j: i64 = 0;
+            while j < argv[i].len {
+                if argv[i][j] == 0 {
+                    usage_error("output path must not contain NUL");
+                }
+                j++;
+            }
+            output.append(argv[i]);
+        } else if a == "--quiet" || a == "-q" {
+            quiet = true;
         } else if a == "--json" {
             json = true;
         } else if a == "--tor" {
@@ -105,9 +159,9 @@ fn parse_args() -> Config {
         usage_error("missing required -d/--domain or --email");
     }
     if email.len > 0 {
-        return Config { json: json, tor: tor, rdap: rdap, subdomains: subdomains, subdomains_raw: subdomains_raw, email_mode: true, target: email };
+        return Config { json: json, tor: tor, rdap: rdap, subdomains: subdomains, subdomains_raw: subdomains_raw, quiet: quiet, email_mode: true, target: copy(email), output: copy(output) };
     }
-    return Config { json: json, tor: tor, rdap: rdap, subdomains: subdomains, subdomains_raw: subdomains_raw, email_mode: false, target: domain };
+    return Config { json: json, tor: tor, rdap: rdap, subdomains: subdomains, subdomains_raw: subdomains_raw, quiet: quiet, email_mode: false, target: copy(domain), output: copy(output) };
 }
 
 fn find_from(s: const u8[:], start: i64, needle: const u8[:]) -> i64 {
@@ -183,19 +237,19 @@ fn main() {
                 out.append("[]");
             }
             out.push('}');
-            print(out);
-        } else {
+            emit(cfg, out);
+        } else if !cfg.quiet {
             if !email_ok {
-                print(cfg.target, " email lookup failed");
+                emit(cfg, str(cfg.target, " email lookup failed"));
             } else {
-                print(cfg.target, " found in Certificate Transparency:");
-                print("Unique entries (", email_count, "):");
+                emit(cfg, str(cfg.target, " found in Certificate Transparency:"));
+                emit(cfg, str("Unique entries (", email_count, "):"));
                 var start: i64 = 0;
                 var i: i64 = 0;
                 while i <= email_names.len {
                     if i == email_names.len || email_names[i] == '\n' {
                         if i > start {
-                            print("  - ", email_names[start..i]);
+                            emit(cfg, str("  - ", email_names[start..i]));
                         }
                         start = i + 1;
                     }
@@ -203,6 +257,7 @@ fn main() {
                 }
             }
         }
+        write_output(cfg);
         return;
     }
 
@@ -230,37 +285,37 @@ fn main() {
         }
     }
 
-    if !cfg.json {
+    if !cfg.json && !cfg.quiet {
         if dns_ok {
-            print(cfg.target, " resolves to: ", ip);
+            emit(cfg, str(cfg.target, " resolves to: ", ip));
         } else {
-            print(cfg.target, " could not be resolved");
+            emit(cfg, str(cfg.target, " could not be resolved"));
         }
 
         if cfg.rdap {
             if rdap_ok {
-                print("RDAP Summary for ", cfg.target, ": ", rdap_summary);
+                emit(cfg, str("RDAP Summary for ", cfg.target, ": ", rdap_summary));
             } else {
-                print("RDAP Data for ", cfg.target, " could not be retrieved");
+                emit(cfg, str("RDAP Data for ", cfg.target, " could not be retrieved"));
             }
         }
 
         if cfg.subdomains {
             if !crtsh_ok {
-                print(cfg.target, " subdomain lookup failed");
+                emit(cfg, str(cfg.target, " subdomain lookup failed"));
             } else if sub_count > 0 {
-                print("\nUnique subdomains (", sub_count, "):\n");
-                print(sub_names);
+                emit(cfg, str("\nUnique subdomains (", sub_count, "):\n"));
+                emit(cfg, sub_names);
             } else {
-                print("No subdomains found.");
+                emit(cfg, "No subdomains found.");
             }
         }
 
         if cfg.subdomains_raw {
             if crtsh_ok {
-                print(crtsh_raw);
+                emit(cfg, crtsh_raw);
             } else if !cfg.subdomains {
-                print(cfg.target, " subdomain lookup failed");
+                emit(cfg, str(cfg.target, " subdomain lookup failed"));
             }
         }
     }
@@ -352,6 +407,7 @@ fn main() {
         }
 
         out.push('}');
-        print(out);
+        emit(cfg, out);
     }
+    write_output(cfg);
 }
