@@ -278,6 +278,99 @@ static int extract_string_field(const char *json, const char *key,
     return 0;
 }
 
+/* Find the string value of the first "key":"value" at or after `from`.
+ * Returns 1 on success (value copied into dst). */
+static int field_string_from(const char *from, const char *key,
+                             char *dst, size_t cap)
+{
+    char needle[32];
+    int kn = snprintf(needle, sizeof(needle), "\"%s\"", key);
+    if (kn < 0 || (size_t)kn >= sizeof(needle)) {
+        return 0;
+    }
+
+    const char *k = strstr(from, needle);
+    if (k == NULL) {
+        return 0;
+    }
+
+    const char *p = k + kn;
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') {
+        p++;
+    }
+    if (*p != ':') {
+        return 0;
+    }
+    p++;
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') {
+        p++;
+    }
+    if (*p != '"') {
+        return 0;
+    }
+    return copy_json_string(p, dst, cap) != NULL && dst[0] != '\0';
+}
+
+/* Country name = the last non-empty newline-separated line of the first vCard
+ * "adr" label found at or after `from` (the label is a newline-joined postal
+ * address ending in the country, e.g. "...\nUnited States"). */
+static int label_country_from(const char *from, char *dst, size_t cap)
+{
+    char label[256];
+    if (!field_string_from(from, "label", label, sizeof(label))) {
+        return 0; /* copy_json_string already decoded \n into real newlines */
+    }
+
+    size_t len = strlen(label);
+    while (len > 0 && (label[len - 1] == '\n' || label[len - 1] == '\r' ||
+                       label[len - 1] == ' '  || label[len - 1] == '\t')) {
+        len--;
+    }
+    size_t s = len;
+    while (s > 0 && label[s - 1] != '\n') {
+        s--;
+    }
+
+    size_t llen = len - s;
+    if (llen == 0 || llen + 1 > cap) {
+        return 0;
+    }
+    memcpy(dst, label + s, llen);
+    dst[llen] = '\0';
+    return 1;
+}
+
+/* A country for the entity region at/after `from`: prefer an explicit "country"
+ * field (RIRs such as RIPE/APNIC emit a 2-letter code), else the vCard adr
+ * label's country name (ARIN carries the country only there). */
+static int country_from(const char *from, char *dst, size_t cap)
+{
+    if (field_string_from(from, "country", dst, cap)) {
+        return 1;
+    }
+    return label_country_from(from, dst, cap);
+}
+
+/* Fallback when there is no top-level "country": search entity data, preferring
+ * the registrant entity, then administrative, then any entity. Within an entity
+ * "roles" precedes its vCard, so the first country/label after a role keyword
+ * belongs to that entity. */
+static int extract_nested_country(const char *json, char *dst, size_t cap)
+{
+    const char *reg = strstr(json, "\"registrant\"");
+    if (reg != NULL && country_from(reg, dst, cap)) {
+        return 1;
+    }
+
+    const char *adm = strstr(json, "\"administrative\"");
+    if (adm != NULL && country_from(adm, dst, cap)) {
+        return 1;
+    }
+
+    const char *ent = strstr(json, "\"entities\"");
+    return country_from(ent != NULL ? ent : json, dst, cap);
+}
+
 void alosint_extract_rdap_ip_summary(const char *json_str, char *out_buf, int max_len)
 {
     if (out_buf == NULL || max_len <= 0) {
@@ -288,7 +381,7 @@ void alosint_extract_rdap_ip_summary(const char *json_str, char *out_buf, int ma
     char name[128];
     char start[64];
     char end[64];
-    char country[16];
+    char country[48];
     char type[64];
     name[0] = start[0] = end[0] = country[0] = type[0] = '\0';
 
@@ -304,7 +397,11 @@ void alosint_extract_rdap_ip_summary(const char *json_str, char *out_buf, int ma
         if (!extract_string_field(json_str, "endAddress", end, sizeof(end))) {
             end[0] = '\0';
         }
-        if (!extract_string_field(json_str, "country", country, sizeof(country))) {
+        /* Primary: top-level "country" (RIRs like APNIC). Fallback: a country
+         * found inside entity objects (ARIN carries it only in the vCard adr
+         * label, e.g. Google/Cloudflare). */
+        if (!extract_string_field(json_str, "country", country, sizeof(country)) &&
+            !extract_nested_country(json_str, country, sizeof(country))) {
             country[0] = '\0';
         }
         if (!extract_string_field(json_str, "type", type, sizeof(type))) {
