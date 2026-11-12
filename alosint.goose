@@ -9,6 +9,20 @@ extern fn alosint_get_tor() -> i32;
 extern fn alosint_write_file(path: u8&, data: u8&, len: i32) -> i32;
 
 var SINK: u8[>..] = [];
+let VERSION_DATA = embed_file("VERSION");
+
+fn print_version() {
+    var version: u8[>..] = [];
+    var i: i64 = 0;
+    while i < VERSION_DATA.len {
+        if VERSION_DATA[i] == '\n' || VERSION_DATA[i] == '\r' {
+            break;
+        }
+        version.push(VERSION_DATA[i]);
+        i++;
+    }
+    print("alosint ", version);
+}
 
 let HELP = """
     AlOsint 1.0.0 - passive OSINT for authorized targets
@@ -30,6 +44,8 @@ let HELP = """
           --tor              Route HTTP(S) through a local SOCKS5 proxy at 127.0.0.1:9050 (DNS is not proxied).
       -o, --output <file>    Write output to a file instead of stdout
       -q, --quiet            Suppress human-readable output
+      -v, --verbose          Print diagnostic messages to stderr
+      -V, --version          Print version and exit
       -h, --help             Print this help and exit
 
     Legal:
@@ -46,6 +62,7 @@ struct Config {
     subdomains: bool,
     subdomains_raw: bool,
     quiet: bool,
+    verbose: bool,
     email_mode: bool,
     ip_mode: bool,
     target: u8[],
@@ -58,6 +75,12 @@ fn emit(cfg: Config&, msg: const u8[:]) {
     } else {
         SINK.append(msg);
         SINK.push('\n');
+    }
+}
+
+fn vlog(cfg: Config&, msg: const u8[:]) {
+    if cfg.verbose && !cfg.quiet {
+        write_stderr(str("[verbose] ", msg, "\n"));
     }
 }
 
@@ -86,6 +109,14 @@ fn usage_error(msg: const u8[:]) {
 
 fn parse_args() -> Config {
     let argv = args();
+    var vi: i64 = 1;
+    while vi < argv.len {
+        if argv[vi] == "--version" || argv[vi] == "-V" {
+            print_version();
+            exit(0);
+        }
+        vi++;
+    }
     var domain: u8[>..] = [];
     var email: u8[>..] = [];
     var ip: u8[>..] = [];
@@ -96,6 +127,7 @@ fn parse_args() -> Config {
     var subdomains = false;
     var subdomains_raw = false;
     var quiet = false;
+    var verbose = false;
     var i = 1;
     while i < argv.len {
         let a = argv[i];
@@ -151,6 +183,8 @@ fn parse_args() -> Config {
             output.append(argv[i]);
         } else if a == "--quiet" || a == "-q" {
             quiet = true;
+        } else if a == "--verbose" || a == "-v" {
+            verbose = true;
         } else if a == "--json" {
             json = true;
         } else if a == "--tor" {
@@ -179,12 +213,12 @@ fn parse_args() -> Config {
         usage_error("missing required -d/--domain, --email, or --ip");
     }
     if ip.len > 0 {
-        return Config { json: json, tor: tor, rdap: rdap, subdomains: subdomains, subdomains_raw: subdomains_raw, quiet: quiet, email_mode: false, ip_mode: true, target: copy(ip), output: copy(output) };
+        return Config { json: json, tor: tor, rdap: rdap, subdomains: subdomains, subdomains_raw: subdomains_raw, quiet: quiet, verbose: verbose, email_mode: false, ip_mode: true, target: copy(ip), output: copy(output) };
     }
     if email.len > 0 {
-        return Config { json: json, tor: tor, rdap: rdap, subdomains: subdomains, subdomains_raw: subdomains_raw, quiet: quiet, email_mode: true, ip_mode: false, target: copy(email), output: copy(output) };
+        return Config { json: json, tor: tor, rdap: rdap, subdomains: subdomains, subdomains_raw: subdomains_raw, quiet: quiet, verbose: verbose, email_mode: true, ip_mode: false, target: copy(email), output: copy(output) };
     }
-    return Config { json: json, tor: tor, rdap: rdap, subdomains: subdomains, subdomains_raw: subdomains_raw, quiet: quiet, email_mode: false, ip_mode: false, target: copy(domain), output: copy(output) };
+    return Config { json: json, tor: tor, rdap: rdap, subdomains: subdomains, subdomains_raw: subdomains_raw, quiet: quiet, verbose: verbose, email_mode: false, ip_mode: false, target: copy(domain), output: copy(output) };
 }
 
 fn find_from(s: const u8[:], start: i64, needle: const u8[:]) -> i64 {
@@ -210,6 +244,20 @@ fn find_from(s: const u8[:], start: i64, needle: const u8[:]) -> i64 {
     -1
 }
 
+fn count_occurrences(haystack: const u8[:], needle: const u8[:]) -> i32 {
+    var count: i32 = 0;
+    var start: i64 = 0;
+    while true {
+        let pos = find_from(haystack, start, needle);
+        if pos < 0 {
+            break;
+        }
+        count++;
+        start = pos + needle.len;
+    }
+    count
+}
+
 fn main() {
     let cfg = parse_args();
     if cfg.tor {
@@ -217,6 +265,7 @@ fn main() {
     }
 
     if cfg.email_mode {
+        vlog(cfg, str("EMAIL: validating ", cfg.target));
         var email_raw: u8[>..] = [];
         let email_ok = crtsh::lookup_email(cfg.target, email_raw);
         var email_names: u8[>..] = [];
@@ -288,8 +337,14 @@ fn main() {
     }
 
     if cfg.ip_mode {
+        vlog(cfg, str("RDAP: GET https://rdap.org/ip/", cfg.target));
         var ip_rdap: u8[>..] = [];
         let ip_ok = rdap::lookup_ip(cfg.target, ip_rdap);
+        if ip_ok {
+            vlog(cfg, str("RDAP: HTTP 200 (", ip_rdap.len, " bytes)"));
+        } else {
+            vlog(cfg, "RDAP: HTTP error (0 bytes)");
+        }
         var ip_summary: u8[>..] = [];
         if ip_ok {
             rdap::format_ip_summary(ip_rdap, ip_summary);
@@ -351,16 +406,24 @@ fn main() {
         return;
     }
 
+    vlog(cfg, str("DNS: querying A record for ", cfg.target));
     var ip: u8[>..] = [];
     var dns_ok = dns::lookup(cfg.target, ip);
+    if dns_ok {
+        vlog(cfg, str("DNS: resolved ", cfg.target, " -> ", ip));
+    }
 
     var rdap_data: u8[>..] = [];
     var rdap_ok = false;
     var rdap_summary: u8[>..] = [];
     if cfg.rdap {
+        vlog(cfg, str("RDAP: GET https://rdap.org/domain/", cfg.target));
         rdap_ok = rdap::lookup(cfg.target, rdap_data);
         if rdap_ok {
+            vlog(cfg, str("RDAP: HTTP 200 (", rdap_data.len, " bytes)"));
             rdap::format_summary(rdap_data, rdap_summary);
+        } else {
+            vlog(cfg, "RDAP: HTTP error (0 bytes)");
         }
     }
 
@@ -369,7 +432,24 @@ fn main() {
     var sub_names: u8[>..] = [];
     var sub_count: i32 = 0;
     if cfg.subdomains || cfg.subdomains_raw {
+        vlog(cfg, str("CRTSH: GET https://crt.sh/?q=", cfg.target, "&output=json"));
         crtsh_ok = crtsh::lookup(cfg.target, crtsh_raw);
+        if crtsh_ok && crtsh_raw.len >= crtsh::CRTSH_CAP - 1 {
+            if cfg.json {
+                var out: u8[>..] = [];
+                out.append("{\"domain\":\"");
+                json_writer::escape(cfg.target, out);
+                out.append("\",\"subdomains\":null,\"subdomains_error\":\"response too large\"}");
+                emit(cfg, out);
+            } else if !cfg.quiet {
+                write_stderr("alosint: crt.sh response too large (>16 MiB)\n");
+            }
+            write_output(cfg);
+            exit(1);
+        }
+        if crtsh_ok {
+            vlog(cfg, str("CRTSH: parsed ", count_occurrences(crtsh_raw, "\"name_value\""), " certificates"));
+        }
         if crtsh_ok && cfg.subdomains {
             sub_count = crtsh::summary(crtsh_raw, cfg.target, sub_names);
         }
