@@ -13,6 +13,8 @@
 
 #include <curl/curl.h>
 
+#include "net_common.h"
+
 /* Bounded write sink: C copies at most `cap` bytes into a caller-owned buffer,
  * tracking how many were stored. The transfer is always fully consumed so
  * libcurl completes cleanly even when the body is truncated. */
@@ -184,6 +186,13 @@ static int rdap_prereq_cb(void *clientp,
     (void)conn_primary_port;
     (void)conn_local_port;
 
+    /* socks5h tunnels the destination hostname to Tor, which resolves it
+     * internally. We cannot meaningfully check the destination IP here, and the
+     * user explicitly opted into --tor for privacy. */
+    if (alosint_get_tor()) {
+        return CURL_PREREQFUNC_OK;
+    }
+
     /* No IP string, or a private/unparseable one: refuse (fail closed). */
     if (conn_primary_ip == NULL || rdap_ip_is_private(conn_primary_ip)) {
         return CURL_PREREQFUNC_ABORT;
@@ -226,6 +235,14 @@ int alosint_rdap_lookup(const char *domain, char *json_out, int max_len)
 
     CURL *curl = curl_easy_init();
     if (curl == NULL) {
+        return -1;
+    }
+
+    /* Apply the shared Tor/SOCKS5 proxy (no-op unless enabled) before any other
+     * option is set on the handle. Fail closed: if Tor is on but the proxy
+     * cannot be set, abort rather than send the request unproxied. */
+    if (alosint_apply_curl_options((void *)curl) != 0) {
+        curl_easy_cleanup(curl);
         return -1;
     }
 
