@@ -31,4 +31,18 @@
 int alosint_crtsh_extract_unique(const char *json_str, const char *domain,
                                  char *out_buf, int max_len);
 
+/*
+ * alosint_crtsh_extract_emails — collect unique email-like "name_value" entries
+ * from a crt.sh JSON response.
+ *
+ * Splits each "name_value" on newlines (as alosint_crtsh_extract_unique does),
+ * trims whitespace, and keeps a token only when it contains '@' and no interior
+ * whitespace. Keeps original case, de-duplicates, and writes one per line;
+ * out_buf is always NUL-terminated and writes never exceed max_len.
+ *
+ * Returns the number of unique emails written, or -1 if json_str is NULL/empty,
+ * malformed (no "name_value" key), or out_buf is NULL / max_len <= 0.
+ */
+int alosint_crtsh_extract_emails(const char *json_str, char *out_buf, int max_len);
+
 #endif /* ALOSINT_CRTSH_EXTRACT_H */

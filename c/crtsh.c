@@ -60,24 +60,47 @@ static int crtsh_valid_domain(const char *d)
     return 1;
 }
 
-int alosint_crtsh_lookup(const char *domain, char *json_out, int max_len)
+/* Percent-encode `in` into `out` (capacity `cap`, incl. NUL) per RFC 3986:
+ * unreserved bytes (A-Z a-z 0-9 - . _ ~) pass through, everything else becomes
+ * %XX with uppercase hex (so '@' -> %40). Returns 1 on success, 0 if it would
+ * overflow `out`. This keeps caller-controlled input from restructuring the
+ * query URL. */
+static int crtsh_url_encode(const char *in, char *out, size_t cap)
 {
-    if (domain == NULL || json_out == NULL || max_len <= 0) {
-        return -1;
+    static const char hex[] = "0123456789ABCDEF";
+    size_t o = 0;
+
+    for (const unsigned char *p = (const unsigned char *)in; *p != '\0'; p++) {
+        unsigned char c = *p;
+        int unreserved = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                         (c >= '0' && c <= '9') ||
+                         c == '-' || c == '.' || c == '_' || c == '~';
+        if (unreserved) {
+            if (o + 1 >= cap) {
+                return 0;
+            }
+            out[o++] = (char)c;
+        } else {
+            if (o + 3 >= cap) {
+                return 0;
+            }
+            out[o++] = '%';
+            out[o++] = hex[(c >> 4) & 0x0f];
+            out[o++] = hex[c & 0x0f];
+        }
     }
 
-    json_out[0] = '\0';
-
-    if (!crtsh_valid_domain(domain)) {
-        return -1;
+    if (o >= cap) {
+        return 0;
     }
+    out[o] = '\0';
+    return 1;
+}
 
-    char url[600];
-    int n = snprintf(url, sizeof(url), "https://crt.sh/?q=%%25.%s&output=json", domain);
-    if (n < 0 || (size_t)n >= sizeof(url)) {
-        return -1;
-    }
-
+/* Shared HTTPS GET of `url` into json_out (bounded). Identical, hardened curl
+ * options for every crt.sh caller. Returns 0, -1 (transport), or -2 (HTTP). */
+static int crtsh_perform(const char *url, char *json_out, int max_len)
+{
     CURL *curl = curl_easy_init();
     if (curl == NULL) {
         return -1;
@@ -140,4 +163,51 @@ int alosint_crtsh_lookup(const char *domain, char *json_out, int max_len)
         return -2;
     }
     return 0;
+}
+
+int alosint_crtsh_lookup(const char *domain, char *json_out, int max_len)
+{
+    if (domain == NULL || json_out == NULL || max_len <= 0) {
+        return -1;
+    }
+
+    json_out[0] = '\0';
+
+    if (!crtsh_valid_domain(domain)) {
+        return -1;
+    }
+
+    char url[600];
+    int n = snprintf(url, sizeof(url), "https://crt.sh/?q=%%25.%s&output=json", domain);
+    if (n < 0 || (size_t)n >= sizeof(url)) {
+        return -1;
+    }
+
+    return crtsh_perform(url, json_out, max_len);
+}
+
+int alosint_crtsh_lookup_email(const char *email, char *json_out, int max_len)
+{
+    if (email == NULL || json_out == NULL || max_len <= 0) {
+        return -1;
+    }
+
+    json_out[0] = '\0';
+
+    if (email[0] == '\0' || strchr(email, '@') == NULL) {
+        return -1; /* empty, or not an email address */
+    }
+
+    char enc[768];
+    if (!crtsh_url_encode(email, enc, sizeof(enc))) {
+        return -1; /* email too long to encode into a bounded query */
+    }
+
+    char url[900];
+    int n = snprintf(url, sizeof(url), "https://crt.sh/?q=%s&output=json", enc);
+    if (n < 0 || (size_t)n >= sizeof(url)) {
+        return -1;
+    }
+
+    return crtsh_perform(url, json_out, max_len);
 }
