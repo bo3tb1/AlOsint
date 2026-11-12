@@ -232,8 +232,12 @@ int alosint_rdap_lookup(const char *domain, char *json_out, int max_len)
     }
 
     /* Apply the shared Tor/SOCKS5 proxy (no-op unless enabled) before any other
-     * option is set on the handle. */
-    alosint_apply_curl_options((void *)curl);
+     * option is set on the handle. Fail closed: if Tor is on but the proxy
+     * cannot be set, abort rather than send the request unproxied. */
+    if (alosint_apply_curl_options((void *)curl) != 0) {
+        curl_easy_cleanup(curl);
+        return -1;
+    }
 
     struct rdap_sink sink;
     sink.buf = json_out;
