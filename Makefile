@@ -12,6 +12,7 @@ clean:
 
 test:
 	$(GOOSE) check alosint.goose
+	cd tests && ./run.sh
 
 install: alosint
 	install -m 755 alosint /usr/local/bin/alosint
