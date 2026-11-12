@@ -5,6 +5,8 @@
 
 #include <curl/curl.h>
 
+#include "net_common.h"
+
 struct crtsh_sink {
     char  *buf;
     size_t cap;
@@ -80,6 +82,10 @@ int alosint_crtsh_lookup(const char *domain, char *json_out, int max_len)
     if (curl == NULL) {
         return -1;
     }
+
+    /* Apply the shared Tor/SOCKS5 proxy (no-op unless enabled) before any other
+     * option is set on the handle. */
+    alosint_apply_curl_options((void *)curl);
 
     struct crtsh_sink sink;
     sink.buf = json_out;
